@@ -4,14 +4,19 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags:
+      - '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
     paths:
       - "openbsd-an7581.patch"
       - ".github/workflows/build.yml"
       - "scripts/**"
+      - "firmware/**"
 
 jobs:
   build:
     runs-on: ubuntu-26.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - name: Build on OpenBSD 8.0 amd64
@@ -27,5 +32,13 @@ jobs:
         with:
           name: an7581-kernels
           path: |
+            dist/bsd.rd
+            dist/bsd.mp
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          files: |
             dist/bsd.rd
             dist/bsd.mp
