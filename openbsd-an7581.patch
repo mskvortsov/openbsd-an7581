@@ -1,0 +1,4999 @@
+commit 5a5e99578227ee87dd8db72e956b79dc4648878a
+Author: Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
+Date:   Thu Oct 29 14:05:47 2026 +0300
+
+    AN7581
+
+diff --git a/arch/arm64/conf/GENERIC b/arch/arm64/conf/GENERIC
+index d0e34fe..b356076 100644
+--- a/arch/arm64/conf/GENERIC
++++ b/arch/arm64/conf/GENERIC
+@@ -279,6 +279,13 @@ amltemp*	at fdt?
+ amluart*	at fdt?
+ amlusbphy*	at fdt?
+ 
++# Airoha SoCs
++airscu*		at fdt? early 1
++airpcs*		at fdt?
++airgpio*	at fdt?
++aireth*		at fdt?
++airsw*		at fdt?
++
+ # HiSilicon SoCs
+ hiclock*	at fdt? early 1
+ hidwusb*	at fdt?
+diff --git a/arch/arm64/conf/RAMDISK b/arch/arm64/conf/RAMDISK
+index 6cb7c82..34362c5 100644
+--- a/arch/arm64/conf/RAMDISK
++++ b/arch/arm64/conf/RAMDISK
+@@ -208,6 +208,13 @@ amlrng*		at fdt?
+ amluart*	at fdt?
+ amlusbphy*	at fdt?
+ 
++# Airoha SoCs
++airscu*		at fdt? early 1
++airpcs*		at fdt?
++airgpio*	at fdt?
++aireth*		at fdt?
++airsw*		at fdt?
++
+ # HiSilicon SoCs
+ hiclock*	at fdt? early 1
+ hidwusb*	at fdt?
+diff --git a/arch/arm64/dev/agintc.c b/arch/arm64/dev/agintc.c
+index 37064c4..fff7020 100644
+--- a/arch/arm64/dev/agintc.c
++++ b/arch/arm64/dev/agintc.c
+@@ -777,6 +777,7 @@ agintc_cpuinit(void)
+ 	struct agintc_softc *sc = agintc_sc;
+ 	uint32_t waker;
+ 	int timeout = 100000;
++	uint64_t ctlr;
+ 	int hwcpu;
+ 	int i;
+ 
+@@ -812,6 +813,18 @@ agintc_cpuinit(void)
+ 	if (sc->sc_ipi_irq != NULL)
+ 		agintc_route_irq(sc->sc_ipi_irq, IRQ_ENABLE, curcpu());
+ 
++	/*
++	 * We only write ICC_EOIR1 and never ICC_DIR, so make sure EOI
++	 * also deactivates.  A previous kernel (e.g. Linux before a
++	 * kexec) may have left split priority drop/deactivate enabled.
++	 */
++	__asm volatile("mrs %x0, "STR(ICC_CTLR) : "=r"(ctlr));
++	if (ctlr & ICC_CTLR_EL1_EOIMODE) {
++		ctlr &= ~ICC_CTLR_EL1_EOIMODE;
++		__asm volatile("msr "STR(ICC_CTLR)", %x0" :: "r"(ctlr));
++		__asm volatile("isb");
++	}
++
+ 	__asm volatile("msr "STR(ICC_PMR)", %x0" :: "r"(0xff));
+ 	__asm volatile("msr "STR(ICC_BPR1)", %x0" :: "r"(0));
+ 	__asm volatile("msr "STR(ICC_IGRPEN1)", %x0" :: "r"(1));
+diff --git a/dev/fdt/airgpio.c b/dev/fdt/airgpio.c
+new file mode 100644
+index 0000000..3f53317
+--- /dev/null
++++ b/dev/fdt/airgpio.c
+@@ -0,0 +1,419 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/* EN7581 GPIO and the pin states needed for external Ethernet MDIO. */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/device.h>
++#include <sys/kernel.h>
++#include <sys/mutex.h>
++
++#include <machine/bus.h>
++#include <machine/fdt.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_gpio.h>
++#include <dev/ofw/ofw_misc.h>
++#include <dev/ofw/ofw_pinctrl.h>
++#include <dev/ofw/fdt.h>
++#include <dev/fdt/airgpiovar.h>
++
++#define AIRGPIO_NPINS		50
++#define AIRGPIO_DATA(n)		((n) < 32 ? 0x04 : 0x70)
++#define AIRGPIO_OE(n)		((n) < 32 ? 0x14 : 0x78)
++#define AIRGPIO_PWM(n)		((n) < 16 ? 0x34 : 0x68)
++#define AIRGPIO_PU(n)		((n) < 32 ? 0x4c : 0x54)
++#define AIRGPIO_PD(n)		((n) < 32 ? 0x50 : 0x58)
++#define AIRGPIO_MDC		0x214
++#define AIRGPIO_SPI		0x218
++#define AIRGPIO_PON		0x21c
++#define AIRGPIO_FORCE		0x228
++
++struct airgpio_softc {
++	struct device		sc_dev;
++	struct regmap		*sc_gpio;
++	struct regmap		*sc_chip;
++	struct mutex		sc_lock;
++	struct gpio_controller	sc_gc;
++	int			sc_node;
++};
++
++int	airgpio_match(struct device *, void *, void *);
++void	airgpio_attach(struct device *, struct device *, void *);
++void	airgpio_config_pin(void *, uint32_t *, int);
++int	airgpio_get_pin(void *, uint32_t *);
++void	airgpio_set_pin(void *, uint32_t *, int);
++int	airgpio_pinctrl(uint32_t, void *);
++int	airgpio_state(struct airgpio_softc *, int, int);
++int	airgpio_update(struct regmap *, unsigned int, uint32_t, uint32_t);
++int	airgpio_config(struct airgpio_softc *, unsigned int, int);
++int	airgpio_set(struct airgpio_softc *, unsigned int, int);
++int	airgpio_get(struct airgpio_softc *, unsigned int);
++int	airgpio_pin(const char *);
++void	airgpio_wait(struct airgpio_softc *, unsigned int);
++
++const struct cfattach airgpio_ca = {
++	sizeof(struct airgpio_softc), airgpio_match, airgpio_attach
++};
++
++struct cfdriver airgpio_cd = {
++	NULL, "airgpio", DV_DULL
++};
++
++int
++airgpio_match(struct device *parent, void *match, void *aux)
++{
++	struct fdt_attach_args *faa = aux;
++
++	return OF_is_compatible(faa->fa_node, "airoha,en7581-pinctrl");
++}
++
++void
++airgpio_attach(struct device *parent, struct device *self, void *aux)
++{
++	struct airgpio_softc *sc = (struct airgpio_softc *)self;
++	struct fdt_attach_args *faa = aux;
++	uint32_t phandle, ranges[4];
++
++	sc->sc_gpio = regmap_bynode(OF_parent(faa->fa_node));
++	phandle = OF_getpropint(faa->fa_node, "airoha,chip-scu", 0);
++	if (phandle)
++		sc->sc_chip = regmap_byphandle(phandle);
++	else
++		sc->sc_chip = regmap_bycompatible("airoha,en7581-chip-scu");
++	if (sc->sc_gpio == NULL || sc->sc_chip == NULL) {
++		printf(": missing GPIO/chip SCU registers\n");
++		return;
++	}
++	if (OF_getpropint(faa->fa_node, "#gpio-cells", 0) != 2 ||
++	    OF_getpropint(faa->fa_node, "phandle", 0) == 0) {
++		printf(": invalid GPIO binding\n");
++		return;
++	}
++	/* GPIO numbers start at zero; pinctrl's pad numbers start at 13. */
++	if (OF_getpropintarray(faa->fa_node, "gpio-ranges", ranges,
++	    sizeof(ranges)) != sizeof(ranges) || ranges[1] != 0 ||
++	    ranges[2] != 13 || ranges[3] != AIRGPIO_NPINS ||
++	    OF_getnodebyphandle(ranges[0]) != faa->fa_node) {
++		printf(": unsupported GPIO ranges\n");
++		return;
++	}
++	mtx_init(&sc->sc_lock, IPL_HIGH);
++	sc->sc_node = faa->fa_node;
++	sc->sc_gc.gc_node = faa->fa_node;
++	sc->sc_gc.gc_cookie = sc;
++	sc->sc_gc.gc_config_pin = airgpio_config_pin;
++	sc->sc_gc.gc_get_pin = airgpio_get_pin;
++	sc->sc_gc.gc_set_pin = airgpio_set_pin;
++	printf(": %d GPIOs\n", AIRGPIO_NPINS);
++	pinctrl_register(faa->fa_node, airgpio_pinctrl, sc);
++	gpio_controller_register(&sc->sc_gc);
++}
++
++int
++airgpio_update(struct regmap *map, unsigned int reg, uint32_t mask,
++    uint32_t value)
++{
++	uint32_t old = regmap_read_4(map, reg);
++
++	if (old == 0xdeadbeef)
++		return EIO;
++	regmap_write_4(map, reg, (old & ~mask) | (value & mask));
++	return 0;
++}
++
++/* The caller holds sc_lock.  GPIO direction uses TWO bits per pin. */
++int
++airgpio_config(struct airgpio_softc *sc, unsigned int pin, int config)
++{
++	static const unsigned int dir[] = { 0x00, 0x20, 0x60, 0x64 };
++	unsigned int pwm, shift;
++	uint32_t bit;
++	int error;
++
++	if (pin >= AIRGPIO_NPINS ||
++	    (config & ~(GPIO_CONFIG_OUTPUT | GPIO_CONFIG_PULL_UP |
++	    GPIO_CONFIG_PULL_DOWN)) ||
++	    (config & (GPIO_CONFIG_PULL_UP | GPIO_CONFIG_PULL_DOWN)) ==
++	    (GPIO_CONFIG_PULL_UP | GPIO_CONFIG_PULL_DOWN))
++		return EINVAL;
++	if (pin >= 47 &&
++	    (config & (GPIO_CONFIG_PULL_UP | GPIO_CONFIG_PULL_DOWN)))
++		return EOPNOTSUPP;
++	bit = 1U << (pin % 32);
++	/* Disable this pin's PWM override; GPIO32..35 have no PWM bit. */
++	if (pin < 32 || pin >= 36) {
++		pwm = pin < 16 ? pin : pin < 32 ? pin - 16 : pin - 20;
++		if ((error = airgpio_update(sc->sc_gpio, AIRGPIO_PWM(pin),
++		    1U << pwm, 0)) != 0)
++			return error;
++	}
++	if (pin >= 47) {
++		pwm = pin == 49 ? 12 : pin - 38;
++		if ((error = airgpio_update(sc->sc_chip, AIRGPIO_PON,
++		    1U << pwm, 1U << pwm)) != 0)
++			return error;
++	}
++	if (config & (GPIO_CONFIG_PULL_UP | GPIO_CONFIG_PULL_DOWN)) {
++		if ((error = airgpio_update(sc->sc_chip, AIRGPIO_PU(pin),
++		    bit, config & GPIO_CONFIG_PULL_UP ? bit : 0)) ||
++		    (error = airgpio_update(sc->sc_chip, AIRGPIO_PD(pin),
++		    bit, config & GPIO_CONFIG_PULL_DOWN ? bit : 0)))
++			return error;
++	}
++	if ((error = airgpio_update(sc->sc_gpio, AIRGPIO_OE(pin), bit,
++	    config & GPIO_CONFIG_OUTPUT ? bit : 0)) != 0)
++		return error;
++	shift = 2 * (pin % 16);
++	return airgpio_update(sc->sc_gpio, dir[pin / 16], 3U << shift,
++	    config & GPIO_CONFIG_OUTPUT ? 1U << shift : 0);
++}
++
++int
++airgpio_set(struct airgpio_softc *sc, unsigned int pin, int value)
++{
++	uint32_t bit;
++
++	if (pin >= AIRGPIO_NPINS)
++		return EINVAL;
++	bit = 1U << (pin % 32);
++	return airgpio_update(sc->sc_gpio, AIRGPIO_DATA(pin), bit,
++	    value ? bit : 0);
++}
++
++int
++airgpio_get(struct airgpio_softc *sc, unsigned int pin)
++{
++	uint32_t val;
++
++	if (pin >= AIRGPIO_NPINS)
++		return -1;
++	val = regmap_read_4(sc->sc_gpio, AIRGPIO_DATA(pin));
++	if (val == 0xdeadbeef)
++		return -1;
++	return !!(val & (1U << (pin % 32)));
++}
++
++void
++airgpio_config_pin(void *cookie, uint32_t *cells, int config)
++{
++	struct airgpio_softc *sc = cookie;
++
++	if (cells[1] & ~GPIO_ACTIVE_LOW)
++		return;
++	mtx_enter(&sc->sc_lock);
++	airgpio_config(sc, cells[0], config);
++	mtx_leave(&sc->sc_lock);
++}
++
++int
++airgpio_get_pin(void *cookie, uint32_t *cells)
++{
++	struct airgpio_softc *sc = cookie;
++	int value;
++
++	if (cells[1] & ~GPIO_ACTIVE_LOW)
++		return 0;
++	mtx_enter(&sc->sc_lock);
++	value = airgpio_get(sc, cells[0]);
++	mtx_leave(&sc->sc_lock);
++	return value < 0 ? 0 : value ^ !!(cells[1] & GPIO_ACTIVE_LOW);
++}
++
++void
++airgpio_set_pin(void *cookie, uint32_t *cells, int value)
++{
++	struct airgpio_softc *sc = cookie;
++
++	if (cells[1] & ~GPIO_ACTIVE_LOW)
++		return;
++	mtx_enter(&sc->sc_lock);
++	airgpio_set(sc, cells[0], !!value ^ !!(cells[1] & GPIO_ACTIVE_LOW));
++	mtx_leave(&sc->sc_lock);
++}
++
++int
++airgpio_pin(const char *name)
++{
++	unsigned int pin = 0;
++
++	if (strncmp(name, "gpio", 4) != 0 || name[4] == '\0')
++		return -1;
++	for (name += 4; *name; name++) {
++		if (*name < '0' || *name > '9')
++			return -1;
++		pin = pin * 10 + *name - '0';
++		if (pin >= AIRGPIO_NPINS)
++			return -1;
++	}
++	return pin;
++}
++
++/* Validate before applying.  Unknown mux functions never report success. */
++int
++airgpio_state(struct airgpio_softc *sc, int node, int apply)
++{
++	char function[32], groups[32], pins[512];
++	int child, len, pos, pin, output, high, low, input, error;
++
++	if (!OF_is_enabled(node))
++		return ENODEV;
++	if (OF_child(node)) {
++		for (child = OF_child(node); child; child = OF_peer(child))
++			if ((error = airgpio_state(sc, child, apply)) != 0)
++				return error;
++		return 0;
++	}
++	len = OF_getproplen(node, "function");
++	if (len >= 0) {
++		memset(function, 0, sizeof(function));
++		memset(groups, 0, sizeof(groups));
++		if (len != sizeof("mdio") || OF_getprop(node, "function",
++		    function, sizeof(function)) != len || strcmp(function, "mdio"))
++			return EOPNOTSUPP;
++		len = OF_getproplen(node, "groups");
++		if (len != sizeof("mdio") || OF_getprop(node, "groups", groups,
++		    sizeof(groups)) != len || strcmp(groups, "mdio"))
++			return EINVAL;
++		if (!apply)
++			return 0;
++		/* Take GPIO1/2 back from I2C, PCM-SPI and PWM before MDC mode. */
++		if ((error = airgpio_update(sc->sc_chip, AIRGPIO_MDC,
++		    (1U << 14) | (1U << 13) | (1U << 11) | 1,
++		    1U << 14)) ||
++		    (error = airgpio_update(sc->sc_chip, AIRGPIO_SPI,
++		    (1U << 9) | (1U << 8), 0)) ||
++		    (error = airgpio_update(sc->sc_chip, AIRGPIO_PON,
++		    1U << 13, 0)) ||
++		    (error = airgpio_update(sc->sc_gpio, 0x34, 6, 0)) ||
++		    (error = airgpio_update(sc->sc_chip, AIRGPIO_FORCE, 6, 6)))
++			return error;
++		return 0;
++	}
++	len = OF_getproplen(node, "pins");
++	if (len <= 0 || len > sizeof(pins) ||
++	    OF_getprop(node, "pins", pins, sizeof(pins)) != len ||
++	    pins[len - 1] != '\0')
++		return EINVAL;
++	high = OF_getproplen(node, "output-high") == 0;
++	low = OF_getproplen(node, "output-low") == 0;
++	input = OF_getproplen(node, "input-enable") == 0;
++	output = high || low;
++	if (high + low + input != 1)
++		return EOPNOTSUPP;
++	for (pos = 0; pos < len; pos += strlen(pins + pos) + 1) {
++		pin = airgpio_pin(pins + pos);
++		if (pin < 0)
++			return EINVAL;
++		if (!apply)
++			continue;
++		/* Preload the latch before enabling output to avoid a glitch. */
++		if (output && (error = airgpio_set(sc, pin, high)) != 0)
++			return error;
++		if ((error = airgpio_config(sc, pin,
++		    output ? GPIO_CONFIG_OUTPUT : GPIO_CONFIG_INPUT)) != 0)
++			return error;
++	}
++	return 0;
++}
++
++int
++airgpio_pinctrl(uint32_t phandle, void *cookie)
++{
++	struct airgpio_softc *sc = cookie;
++	int node = OF_getnodebyphandle(phandle), error;
++
++	if (node == 0 || OF_parent(node) != sc->sc_node)
++		return EINVAL;
++	mtx_enter(&sc->sc_lock);
++	error = airgpio_state(sc, node, 0);
++	if (!error)
++		error = airgpio_state(sc, node, 1);
++	mtx_leave(&sc->sc_lock);
++	return error;
++}
++
++void
++airgpio_wait(struct airgpio_softc *sc, unsigned int usec)
++{
++	if (usec >= 1000)
++		tsleep_nsec(sc, PWAIT, "airgprst", (uint64_t)usec * 1000);
++	else
++		delay(usec);
++}
++
++/* Called at mountroot, before any PHY MDIO transaction or firmware upload. */
++int
++airgpio_phy_reset(int phynode)
++{
++	struct airgpio_softc *sc = NULL, *candidate;
++	uint32_t gpio[3], states[16], assert_us, deassert_us;
++	int busnode, provider, len, index, i, error, asserted;
++
++	if (OF_getproplen(phynode, "reset-gpios") != sizeof(gpio) ||
++	    OF_getpropintarray(phynode, "reset-gpios", gpio,
++	    sizeof(gpio)) != sizeof(gpio) || gpio[1] >= AIRGPIO_NPINS ||
++	    (gpio[2] & ~GPIO_ACTIVE_LOW))
++		return EINVAL;
++	provider = OF_getnodebyphandle(gpio[0]);
++	for (i = 0; i < airgpio_cd.cd_ndevs; i++) {
++		candidate = airgpio_cd.cd_devs[i];
++		if (candidate && candidate->sc_node != 0 &&
++		    candidate->sc_node == provider)
++			sc = candidate;
++	}
++	if (sc == NULL)
++		return ENODEV;
++	assert_us = OF_getpropint(phynode, "reset-assert-us", 10000);
++	deassert_us = OF_getpropint(phynode, "reset-deassert-us", 20000);
++	if (assert_us > 1000000 || deassert_us > 1000000)
++		return EINVAL;
++	/* The MDIO controller is a child of the switch owning pinctrl-0. */
++	busnode = OF_parent(OF_parent(phynode));
++	index = OF_getindex(busnode, "default", "pinctrl-names");
++	if (index != 0)
++		return ENODEV;
++	len = OF_getproplen(busnode, "pinctrl-0");
++	if (len <= 0 || len > sizeof(states) || (len % 4) != 0 ||
++	    OF_getpropintarray(busnode, "pinctrl-0", states,
++	    sizeof(states)) != len)
++		return EINVAL;
++	/* Call each state directly: pinctrl_byid() discards callback errors. */
++	for (i = 0; i < len / sizeof(states[0]); i++)
++		if (pinctrl_byphandle(states[i]) != 0)
++			return EIO;
++	asserted = !(gpio[2] & GPIO_ACTIVE_LOW);
++	mtx_enter(&sc->sc_lock);
++	error = airgpio_set(sc, gpio[1], asserted);
++	if (!error)
++		error = airgpio_config(sc, gpio[1], GPIO_CONFIG_OUTPUT);
++	if (!error && airgpio_get(sc, gpio[1]) != asserted)
++		error = EIO;
++	mtx_leave(&sc->sc_lock);
++	if (error)
++		return error;
++	airgpio_wait(sc, assert_us);
++	mtx_enter(&sc->sc_lock);
++	error = airgpio_set(sc, gpio[1], !asserted);
++	if (!error && airgpio_get(sc, gpio[1]) != !asserted)
++		error = EIO;
++	mtx_leave(&sc->sc_lock);
++	if (!error)
++		airgpio_wait(sc, deassert_us);
++	return error;
++}
+diff --git a/dev/fdt/airgpiovar.h b/dev/fdt/airgpiovar.h
+new file mode 100644
+index 0000000..f0d92dd
+--- /dev/null
++++ b/dev/fdt/airgpiovar.h
+@@ -0,0 +1,24 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _DEV_FDT_AIRGPIOVAR_H_
++#define _DEV_FDT_AIRGPIOVAR_H_
++
++/* Apply the MDIO pin state and externally reset its PHY; may sleep. */
++int	airgpio_phy_reset(int);
++
++#endif
+diff --git a/dev/fdt/airmdio.h b/dev/fdt/airmdio.h
+new file mode 100644
+index 0000000..328f3f1
+--- /dev/null
++++ b/dev/fdt/airmdio.h
+@@ -0,0 +1,40 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _DEV_FDT_AIRMDIO_H_
++#define _DEV_FDT_AIRMDIO_H_
++
++#include <sys/mutex.h>
++
++/*
++ * Clause 22 transport.  Callers hold am_lock for complete transactions,
++ * including page selection/restoration and indirect Clause 45 accesses.
++ * am_read returns a 16-bit value or -1; am_write returns an errno or zero.
++ * Neither callback sleeps.
++ */
++struct air_mdio {
++	struct mutex	am_lock;
++	void		*am_cookie;
++	int		(*am_read)(void *, int, int);
++	int		(*am_write)(void *, int, int, int);
++};
++
++struct air_mdio *airsw_mdio_by_node(int);
++int	airsw_lan_ready(int);
++void	airsw_dump(void);
++
++#endif
+diff --git a/dev/fdt/airpcs.c b/dev/fdt/airpcs.c
+new file mode 100644
+index 0000000..2a453b1
+--- /dev/null
++++ b/dev/fdt/airpcs.c
+@@ -0,0 +1,518 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/* AN7581 Ethernet PCS: the fixed 2500BASE-X link to the EN8811H. */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/device.h>
++#include <sys/kernel.h>
++#include <sys/mutex.h>
++
++#include <machine/bus.h>
++#include <machine/fdt.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_clock.h>
++#include <dev/ofw/ofw_misc.h>
++#include <dev/ofw/fdt.h>
++#include <dev/fdt/airpcsvar.h>
++
++enum {
++	AIRPCS_MAC, AIRPCS_AN, AIRPCS_PCS, AIRPCS_MULTI, AIRPCS_USX,
++	AIRPCS_RATE, AIRPCS_ANA, AIRPCS_PMA, AIRPCS_NBANKS
++};
++#define AIRPCS_DELAY		255
++#define AIRPCS_SCU_REV		0x005c
++#define AIRPCS_SCU_XSI		0x0094
++#define  AIRPCS_SCU_XSI_MASK	(3U << 13)
++#define  AIRPCS_SCU_HSGMII	(2U << 13)
++#define AIRPCS_MAC_CFG		0x000
++#define  AIRPCS_MAC_STOP		0x0000000f
++#define  AIRPCS_MAC_FC		0x00000030
++#define  AIRPCS_MAC_FRAG_IPG	0x07fe2800
++#define AIRPCS_AN_CTRL		0x000
++#define  AIRPCS_AN_RESET		(1U << 15)
++#define  AIRPCS_AN_ENABLE		(1U << 12)
++#define AIRPCS_AN_STATUS		0x004
++#define  AIRPCS_LINK		(1U << 2)
++#define AIRPCS_MULTI_MODE		0x018
++#define AIRPCS_PMA_RESET		0x460
++#define  AIRPCS_TXPCS_RESET_N	(1U << 10)
++#define AIRPCS_FREQDET		0x530
++#define  AIRPCS_FREQ_LOCK		(1U << 0)
++#define AIRPCS_IDAC		0x794
++#define AIRPCS_FLL_IDAC		0x174
++#define AIRPCS_FREQ_CTRL		0x158
++#define AIRPCS_CAL_TARGET		0xa000
++#define AIRPCS_CAL_WINDOW		100
++#define AIRPCS_CAL_TRIES		10
++
++struct airpcs_step {
++	uint8_t		bank;
++	uint16_t	reg;
++	uint32_t	mask;
++	uint32_t	value;
++};
++
++#include <dev/fdt/airpcstables.h>
++
++struct airpcs_softc {
++	struct device		sc_dev;
++	bus_space_tag_t		sc_iot;
++	bus_space_handle_t	sc_ioh[AIRPCS_NBANKS];
++	bus_size_t		sc_size[AIRPCS_NBANKS];
++	struct regmap		*sc_scu;
++	struct mutex		sc_lock;
++	int			sc_node;
++	unsigned int		sc_rev;
++	int			sc_busy;
++	int			sc_ready;
++	int			sc_link;
++	unsigned int		sc_idac;
++	unsigned int		sc_recoveries;
++};
++
++int	airpcs_match(struct device *, void *, void *);
++void	airpcs_attach(struct device *, struct device *, void *);
++int	airpcs_update(struct airpcs_softc *, unsigned int, unsigned int,
++	    uint32_t, uint32_t);
++int	airpcs_apply(struct airpcs_softc *, const struct airpcs_step *, size_t,
++	    int);
++void	airpcs_wait(struct airpcs_softc *, unsigned int, int);
++int	airpcs_measure(struct airpcs_softc *, unsigned int, unsigned int *);
++int	airpcs_calibrate(struct airpcs_softc *);
++int	airpcs_config(struct airpcs_softc *);
++
++const struct cfattach airpcs_ca = {
++	sizeof(struct airpcs_softc), airpcs_match, airpcs_attach
++};
++
++struct cfdriver airpcs_cd = {
++	NULL, "airpcs", DV_DULL
++};
++
++#define R(sc, bank, reg) \
++	bus_space_read_4((sc)->sc_iot, (sc)->sc_ioh[(bank)], (reg))
++#define W(sc, bank, reg, val) \
++	bus_space_write_4((sc)->sc_iot, (sc)->sc_ioh[(bank)], (reg), (val))
++#define APPLY(sc, table, sleep) \
++	airpcs_apply((sc), (table), nitems(table), (sleep))
++
++int
++airpcs_match(struct device *parent, void *match, void *aux)
++{
++	struct fdt_attach_args *faa = aux;
++
++	return OF_is_compatible(faa->fa_node, "airoha,an7581-pcs-eth");
++}
++
++void
++airpcs_attach(struct device *parent, struct device *self, void *aux)
++{
++	static const char *names[] = {
++		"pcs_mac", "hsgmii_an", "hsgmii_pcs", "multi_sgmii",
++		"usxgmii", "hsgmii_rate_adp", "pcs_ana", "pcs_pma"
++	};
++	static const bus_size_t minsize[] = {
++		0x104, 0x038, 0x108, 0x104, 0x004, 0x104, 0x400, 0x900
++	};
++	struct airpcs_softc *sc = (struct airpcs_softc *)self;
++	struct fdt_attach_args *faa = aux;
++	uint32_t phandle, resets[4], rev;
++	int n, idx;
++
++	phandle = OF_getpropint(faa->fa_node, "airoha,scu", 0);
++	sc->sc_scu = regmap_byphandle(phandle);
++	if (sc->sc_scu == NULL || phandle == 0 ||
++	    OF_getproplen(faa->fa_node, "resets") != sizeof(resets) ||
++	    OF_getpropintarray(faa->fa_node, "resets", resets,
++	    sizeof(resets)) != sizeof(resets) || resets[0] != phandle ||
++	    resets[2] != phandle ||
++	    OF_getindex(faa->fa_node, "mac", "reset-names") < 0 ||
++	    OF_getindex(faa->fa_node, "phy", "reset-names") < 0) {
++		printf(": missing SCU/reset controller\n");
++		return;
++	}
++	rev = regmap_read_4(sc->sc_scu, AIRPCS_SCU_REV);
++	if (rev == 0xdeadbeef || rev == 0xffffffff) {
++		printf(": can't read SoC revision\n");
++		return;
++	}
++	sc->sc_rev = rev & 0xffff;
++	sc->sc_iot = faa->fa_iot;
++	for (n = 0; n < AIRPCS_NBANKS; n++) {
++		idx = OF_getindex(faa->fa_node, names[n], "reg-names");
++		if (idx < 0 || idx >= faa->fa_nreg ||
++		    faa->fa_reg[idx].size < minsize[n]) {
++			printf(": missing or short %s registers\n", names[n]);
++			goto unmap;
++		}
++		sc->sc_size[n] = faa->fa_reg[idx].size;
++		if (bus_space_map(sc->sc_iot, faa->fa_reg[idx].addr,
++		    sc->sc_size[n], 0, &sc->sc_ioh[n])) {
++			printf(": can't map %s registers\n", names[n]);
++			goto unmap;
++		}
++	}
++	mtx_init(&sc->sc_lock, IPL_NET);
++	sc->sc_node = faa->fa_node;
++	printf(": AN7581 Ethernet PCS, rev %u, %s calibration\n", sc->sc_rev,
++	    sc->sc_rev < 2 ? "manual" : "automatic");
++	return;
++unmap:
++	while (n-- > 0)
++		bus_space_unmap(sc->sc_iot, sc->sc_ioh[n], sc->sc_size[n]);
++}
++
++struct airpcs_softc *
++airpcs_by_node(int node)
++{
++	struct airpcs_softc *sc;
++	int i;
++
++	if (node == 0)
++		return NULL;
++	for (i = 0; i < airpcs_cd.cd_ndevs; i++) {
++		sc = airpcs_cd.cd_devs[i];
++		if (sc != NULL && sc->sc_node == node)
++			return sc;
++	}
++	return NULL;
++}
++
++int
++airpcs_update(struct airpcs_softc *sc, unsigned int bank, unsigned int reg,
++    uint32_t mask, uint32_t value)
++{
++	uint32_t old;
++
++	if (bank >= AIRPCS_NBANKS || (reg & 3) || sc->sc_size[bank] < 4 ||
++	    reg > sc->sc_size[bank] - 4)
++		return EINVAL;
++	old = R(sc, bank, reg);
++	if (old == 0xdeadbeef)
++		return EIO;
++	W(sc, bank, reg, (old & ~mask) | (value & mask));
++	return 0;
++}
++
++void
++airpcs_wait(struct airpcs_softc *sc, unsigned int usec, int can_sleep)
++{
++	if (can_sleep && usec >= 1000)
++		tsleep_nsec(sc, PWAIT, "airpcs", (uint64_t)usec * 1000);
++	else
++		delay(usec);
++}
++
++int
++airpcs_apply(struct airpcs_softc *sc, const struct airpcs_step *steps,
++    size_t count, int can_sleep)
++{
++	size_t i;
++	int error;
++
++	for (i = 0; i < count; i++) {
++		if (steps[i].bank == AIRPCS_DELAY) {
++			airpcs_wait(sc, steps[i].value, can_sleep);
++			continue;
++		}
++		error = airpcs_update(sc, steps[i].bank, steps[i].reg,
++		    steps[i].mask, steps[i].value);
++		if (error)
++			return error;
++	}
++	return 0;
++}
++
++int
++airpcs_measure(struct airpcs_softc *sc, unsigned int idac, unsigned int *diff)
++{
++	uint32_t val;
++	unsigned int freq;
++	int error;
++
++	if ((error = airpcs_update(sc, AIRPCS_PMA, AIRPCS_IDAC, 0x7ff, idac)) ||
++	    (error = airpcs_update(sc, AIRPCS_PMA, AIRPCS_FREQ_CTRL, 7, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_PMA, AIRPCS_FREQ_CTRL, 7, 3)))
++		return error;
++	airpcs_wait(sc, 5000, 1);
++	val = R(sc, AIRPCS_PMA, AIRPCS_FREQDET);
++	if (val == 0xdeadbeef || val == 0xffffffff)
++		return EIO;
++	freq = val >> 16;
++	*diff = freq > AIRPCS_CAL_TARGET ? freq - AIRPCS_CAL_TARGET :
++	    AIRPCS_CAL_TARGET - freq;
++	return 0;
++}
++
++/*
++ * Pre-E2 silicon needs an IDAC measured against 0xa000 +/- 100.
++ * Check all eight coarse bands, then all fine codes in the best band
++ * and its lower neighbour (fine tuning can cross the coarse boundary).
++ * The bounded search avoids assumptions about monotonic fine-code steps.
++ */
++int
++airpcs_calibrate(struct airpcs_softc *sc)
++{
++	unsigned int best = 0, bestdiff = UINT_MAX, diff, coarse, band, code;
++	unsigned int start, end;
++	int error;
++
++	if ((error = APPLY(sc, airpcs_cal_begin, 1)) != 0)
++		return error;
++	for (coarse = 0; coarse < 8; coarse++) {
++		if ((error = airpcs_measure(sc, coarse << 8, &diff)) != 0)
++			return error;
++		if (diff < bestdiff) {
++			best = coarse << 8;
++			bestdiff = diff;
++		}
++	}
++	band = best >> 8;
++	start = band ? band - 1 : 0;
++	end = band;
++	for (coarse = start; coarse <= end && bestdiff != 0; coarse++) {
++		for (code = 0; code < 256 && bestdiff != 0; code++) {
++			if ((error = airpcs_measure(sc, (coarse << 8) | code,
++			    &diff)) != 0)
++				return error;
++			if (diff < bestdiff) {
++				best = (coarse << 8) | code;
++				bestdiff = diff;
++			}
++		}
++	}
++	if (bestdiff > AIRPCS_CAL_WINDOW)
++		return ERANGE;
++	if ((error = airpcs_measure(sc, best, &diff)) != 0)
++		return error;
++	if (diff > AIRPCS_CAL_WINDOW)
++		return ERANGE;
++	if ((error = APPLY(sc, airpcs_cal_finish, 1)) ||
++	    (error = airpcs_update(sc, AIRPCS_PMA, AIRPCS_FLL_IDAC, 0x7ff, best)) ||
++	    (error = APPLY(sc, airpcs_cal_release, 1)))
++		return error;
++	sc->sc_idac = best;
++	return 0;
++}
++
++int
++airpcs_config(struct airpcs_softc *sc)
++{
++	int error;
++
++	/* 2500BASE-X: no Clause 37 negotiation, fixed host-side rate. */
++	if ((error = airpcs_update(sc, AIRPCS_MULTI, 0x100, 1U << 28, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_PCS, 0, 1U << 30, 1U << 30)) ||
++	    (error = airpcs_update(sc, AIRPCS_PCS, 0x20, 0x513, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_PCS, 0x20, 0xa2c, 0xa2c)) ||
++	    (error = airpcs_update(sc, AIRPCS_PCS, 0x20, 0xa2c, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_RATE, 0, 0x0c000011, 0x11)) ||
++	    (error = airpcs_update(sc, AIRPCS_MULTI, AIRPCS_MULTI_MODE, 0x37, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_RATE, 0x100, 1U << 31, 1U << 31)) ||
++	    (error = airpcs_update(sc, AIRPCS_AN, AIRPCS_AN_CTRL, AIRPCS_AN_ENABLE, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_PCS, 0x14, 1U << 4, 1U << 4)) ||
++	    (error = airpcs_update(sc, AIRPCS_AN, AIRPCS_AN_CTRL,
++	    AIRPCS_AN_RESET, AIRPCS_AN_RESET)))
++		return error;
++	return airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++	    0x07fefc30, AIRPCS_MAC_FRAG_IPG | AIRPCS_MAC_FC);
++}
++
++int
++airpcs_init(struct airpcs_softc *sc)
++{
++	uint32_t val;
++	int error, tries;
++
++	mtx_enter(&sc->sc_lock);
++	if (sc->sc_busy || sc->sc_ready) {
++		mtx_leave(&sc->sc_lock);
++		return EBUSY;
++	}
++	sc->sc_busy = 1;
++	mtx_leave(&sc->sc_lock);
++
++	val = regmap_read_4(sc->sc_scu, AIRPCS_SCU_XSI);
++	if (val == 0xdeadbeef || val == 0xffffffff) {
++		error = EIO;
++		goto fail;
++	}
++	reset_assert(sc->sc_node, "mac");
++	reset_assert(sc->sc_node, "phy");
++	regmap_write_4(sc->sc_scu, AIRPCS_SCU_XSI,
++	    (val & ~AIRPCS_SCU_XSI_MASK) | AIRPCS_SCU_HSGMII);
++	delay(10);
++	reset_deassert(sc->sc_node, "mac");
++	reset_deassert(sc->sc_node, "phy");
++	if ((error = airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++	    AIRPCS_MAC_STOP, AIRPCS_MAC_STOP)) ||
++	    (error = airpcs_update(sc, AIRPCS_MAC, 0x10, 1, 0)) ||
++	    (error = airpcs_update(sc, AIRPCS_MAC, 0x10, 1, 1)))
++		goto fail;
++	airpcs_wait(sc, 1000, 1);
++	if ((error = airpcs_update(sc, AIRPCS_MAC, 0x100, 1, 1)) ||
++	    (error = airpcs_update(sc, AIRPCS_ANA, 0, 1, 1)) ||
++	    (error = APPLY(sc, airpcs_jcpll, 1)))
++		goto fail;
++	delay(200);
++	if ((error = APPLY(sc, airpcs_txpll, 1)) != 0)
++		goto fail;
++	delay(200);
++	airpcs_wait(sc, 100000, 1);
++	if ((error = APPLY(sc, airpcs_txrx, 1)) != 0)
++		goto fail;
++	delay(100);
++	for (tries = 0; tries < AIRPCS_CAL_TRIES; tries++) {
++		if (sc->sc_rev < 2) {
++			if ((error = airpcs_apply(sc, airpcs_cdr, 1, 1)) ||
++			    (error = airpcs_calibrate(sc)) ||
++			    (error = airpcs_apply(sc, airpcs_cdr + 1,
++			    nitems(airpcs_cdr) - 1, 1)))
++				goto fail;
++		} else if ((error = APPLY(sc, airpcs_cdr, 1)) != 0)
++			goto fail;
++		if ((error = APPLY(sc, airpcs_global_reset, 1)) ||
++		    (error = APPLY(sc, airpcs_cdr, 1)))
++			goto fail;
++		val = R(sc, AIRPCS_PMA, AIRPCS_FREQDET);
++		if (val == 0xdeadbeef || val == 0xffffffff) {
++			error = EIO;
++			goto fail;
++		}
++		if (sc->sc_rev >= 2 || (val & AIRPCS_FREQ_LOCK))
++			break;
++	}
++	if (tries == AIRPCS_CAL_TRIES) {
++		error = ETIMEDOUT;
++		goto fail;
++	}
++	if ((error = airpcs_config(sc)) != 0)
++		goto fail;
++	mtx_enter(&sc->sc_lock);
++	sc->sc_ready = 1;
++	sc->sc_busy = 0;
++	sc->sc_link = 0;
++	mtx_leave(&sc->sc_lock);
++	return 0;
++fail:
++	airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++	    AIRPCS_MAC_STOP, AIRPCS_MAC_STOP);
++	reset_assert(sc->sc_node, "mac");
++	reset_assert(sc->sc_node, "phy");
++	mtx_enter(&sc->sc_lock);
++	sc->sc_busy = 0;
++	sc->sc_ready = 0;
++	sc->sc_link = 0;
++	mtx_leave(&sc->sc_lock);
++	return error;
++}
++
++void
++airpcs_down(struct airpcs_softc *sc)
++{
++	mtx_enter(&sc->sc_lock);
++	if (sc->sc_ready && airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++	    AIRPCS_MAC_STOP, AIRPCS_MAC_STOP))
++		sc->sc_ready = 0;
++	sc->sc_link = 0;
++	mtx_leave(&sc->sc_lock);
++}
++
++/* Return one only when copper and the PCS are both up; no sleeping here. */
++int
++airpcs_poll(struct airpcs_softc *sc, int copper_up)
++{
++	uint32_t val;
++	int i, signal = 0, error = 0, link = 0;
++
++	mtx_enter(&sc->sc_lock);
++	if (!sc->sc_ready)
++		goto out;
++	if (!copper_up)
++		goto down;
++	val = R(sc, AIRPCS_AN, AIRPCS_AN_STATUS);
++	if (val != 0xdeadbeef)
++		val = R(sc, AIRPCS_AN, AIRPCS_AN_STATUS);
++	if (val == 0xdeadbeef || val == 0xffffffff) {
++		error = EIO;
++		goto down;
++	}
++	if (!(val & AIRPCS_LINK)) {
++		if ((error = airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++		    AIRPCS_MAC_STOP, AIRPCS_MAC_STOP)) != 0)
++			goto down;
++		/* CDR can remain unlocked when the far end returns after LOS. */
++		if ((error = airpcs_update(sc, AIRPCS_PMA, 0x360,
++		    0x30000, 0x30000)) != 0)
++			goto down;
++		for (i = 0; i < 6; i++) {
++			val = R(sc, AIRPCS_PMA, 0x380);
++			if (val == 0xdeadbeef || val == 0xffffffff) {
++				error = EIO;
++				goto down;
++			}
++			if (val & (1U << 8))
++				signal++;
++		}
++		if (signal >= 4) {
++			error = APPLY(sc, airpcs_cdr, 0);
++			sc->sc_recoveries++;
++		}
++		goto down;
++	}
++	if (!sc->sc_link) {
++		/* Host link is always 2.5G, independently of the copper speed. */
++		if ((error = airpcs_update(sc, AIRPCS_MULTI,
++		    AIRPCS_MULTI_MODE, 0x34, 0x34)) ||
++		    (error = airpcs_update(sc, AIRPCS_PMA,
++		    AIRPCS_PMA_RESET, AIRPCS_TXPCS_RESET_N, 0)))
++			goto down;
++		delay(100);
++		if ((error = airpcs_update(sc, AIRPCS_PMA, AIRPCS_PMA_RESET,
++		    AIRPCS_TXPCS_RESET_N, AIRPCS_TXPCS_RESET_N)) ||
++		    (error = airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++		    AIRPCS_MAC_STOP, 0)))
++			goto down;
++	}
++	sc->sc_link = link = 1;
++	goto out;
++down:
++	if (airpcs_update(sc, AIRPCS_MAC, AIRPCS_MAC_CFG,
++	    AIRPCS_MAC_STOP, AIRPCS_MAC_STOP))
++		error = EIO;
++	sc->sc_link = 0;
++	if (error)
++		sc->sc_ready = 0;
++out:
++	mtx_leave(&sc->sc_lock);
++	return error ? -1 : link;
++}
++
++void
++airpcs_dump(struct airpcs_softc *sc)
++{
++	mtx_enter(&sc->sc_lock);
++	printf("%s: rev %u ready %d link %d idac 0x%x CDR resets %u "
++	    "an 0x%08x pma 0x%08x mac 0x%08x\n", sc->sc_dev.dv_xname,
++	    sc->sc_rev, sc->sc_ready, sc->sc_link, sc->sc_idac,
++	    sc->sc_recoveries, R(sc, AIRPCS_AN, AIRPCS_AN_STATUS),
++	    R(sc, AIRPCS_PMA, AIRPCS_FREQDET), R(sc, AIRPCS_MAC, AIRPCS_MAC_CFG));
++	mtx_leave(&sc->sc_lock);
++}
+diff --git a/dev/fdt/airpcstables.h b/dev/fdt/airpcstables.h
+new file mode 100644
+index 0000000..fe97006
+--- /dev/null
++++ b/dev/fdt/airpcstables.h
+@@ -0,0 +1,282 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * AN7581 Ethernet-lane 2500BASE-X programming values, in execution order.
++ * Register settings are cross-checked against Airoha's Linux PCS reference
++ * (pcs-an7581.c, Christian Marangi, Airoha, 2024).  Each entry names a bank,
++ * byte offset, mask and value; bank 255 denotes a delay in microseconds.
++ * Keep ordering and delays: these are analog power/reset sequences.
++ */
++
++static const struct airpcs_step airpcs_jcpll[] = {
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x000000c8 },
++	{ AIRPCS_ANA, 0x048, 0x00002000, 0x00002000 },
++	{ AIRPCS_ANA, 0x01c, 0x00000007, 0x00000004 },
++	{ AIRPCS_ANA, 0x01c, 0x00000100, 0x00000100 },
++	{ AIRPCS_PMA, 0x828, 0x01010000, 0x01000000 },
++	{ AIRPCS_ANA, 0x01c, 0x03000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x01c, 0x00010000, 0x00000000 },
++	{ AIRPCS_ANA, 0x020, 0x01000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x020, 0x00030000, 0x00030000 },
++	{ AIRPCS_ANA, 0x020, 0x00000300, 0x00000000 },
++	{ AIRPCS_ANA, 0x020, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x024, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x038, 0x0000ffff, 0x00000000 },
++	{ AIRPCS_ANA, 0x034, 0x00ffff00, 0x00000000 },
++	{ AIRPCS_ANA, 0x038, 0xffff0000, 0x00000000 },
++	{ AIRPCS_ANA, 0x034, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x030, 0x00010000, 0x00000000 },
++	{ AIRPCS_ANA, 0x030, 0x00020000, 0x00000000 },
++	{ AIRPCS_ANA, 0x030, 0x00000007, 0x00000000 },
++	{ AIRPCS_ANA, 0x030, 0x00000700, 0x00000000 },
++	{ AIRPCS_ANA, 0x004, 0x3f000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x004, 0x003f0000, 0x00180000 },
++	{ AIRPCS_ANA, 0x004, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x008, 0x1f000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x008, 0x001f0000, 0x00100000 },
++	{ AIRPCS_ANA, 0x008, 0x00001f00, 0x00001f00 },
++	{ AIRPCS_ANA, 0x008, 0x0000001f, 0x0000000a },
++	{ AIRPCS_ANA, 0x00c, 0x0000001f, 0x00000000 },
++	{ AIRPCS_ANA, 0x02c, 0x07000000, 0x04000000 },
++	{ AIRPCS_ANA, 0x02c, 0x00010000, 0x00010000 },
++	{ AIRPCS_ANA, 0x02c, 0x00000300, 0x00000100 },
++	{ AIRPCS_ANA, 0x030, 0x00000700, 0x00000000 },
++	{ AIRPCS_ANA, 0x030, 0x00000038, 0x00000018 },
++	{ AIRPCS_ANA, 0x030, 0x00000007, 0x00000003 },
++	{ AIRPCS_PMA, 0x800, 0x7fffffff, 0x25800000 },
++	{ AIRPCS_PMA, 0x79c, 0x00010000, 0x00010000 },
++	{ AIRPCS_ANA, 0x014, 0x01000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x014, 0x00000003, 0x00000000 },
++	{ AIRPCS_ANA, 0x02c, 0x00000003, 0x00000000 },
++	{ AIRPCS_ANA, 0x010, 0x00030000, 0x00000000 },
++	{ AIRPCS_ANA, 0x010, 0x00000300, 0x00000300 },
++	{ AIRPCS_ANA, 0x010, 0x00000003, 0x00000000 },
++	{ AIRPCS_ANA, 0x00c, 0x07000000, 0x02000000 },
++	{ AIRPCS_ANA, 0x00c, 0x00ff0000, 0x00e40000 },
++	{ AIRPCS_ANA, 0x00c, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x048, 0x001f0000, 0x00100000 },
++	{ AIRPCS_ANA, 0x024, 0x1f000000, 0x05000000 },
++	{ AIRPCS_ANA, 0x024, 0x00070000, 0x00010000 },
++	{ AIRPCS_ANA, 0x024, 0x00000100, 0x00000100 },
++	{ AIRPCS_ANA, 0x028, 0x07000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x028, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x828, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x828, 0x00000101, 0x00000101 },
++};
++
++static const struct airpcs_step airpcs_txpll[] = {
++	{ AIRPCS_ANA, 0x084, 0x03000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x084, 0x00030000, 0x00010000 },
++	{ AIRPCS_ANA, 0x064, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x064, 0x00070000, 0x00040000 },
++	{ AIRPCS_ANA, 0x064, 0x00000300, 0x00000000 },
++	{ AIRPCS_ANA, 0x064, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x854, 0x01010000, 0x01000000 },
++	{ AIRPCS_ANA, 0x068, 0x03000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x068, 0x00010000, 0x00000000 },
++	{ AIRPCS_ANA, 0x068, 0x00000300, 0x00000000 },
++	{ AIRPCS_ANA, 0x068, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x06c, 0x00010000, 0x00000000 },
++	{ AIRPCS_ANA, 0x06c, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x06c, 0x00000003, 0x00000003 },
++	{ AIRPCS_ANA, 0x080, 0xffff0000, 0x00000000 },
++	{ AIRPCS_ANA, 0x080, 0x0000ffff, 0x00000000 },
++	{ AIRPCS_ANA, 0x07c, 0x00010000, 0x00000000 },
++	{ AIRPCS_ANA, 0x07c, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x07c, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x084, 0x0000ffff, 0x00000000 },
++	{ AIRPCS_ANA, 0x050, 0x0000003f, 0x0000000a },
++	{ AIRPCS_ANA, 0x050, 0x00003f00, 0x00000000 },
++	{ AIRPCS_ANA, 0x050, 0x1f000000, 0x1f000000 },
++	{ AIRPCS_ANA, 0x050, 0x001f0000, 0x00050000 },
++	{ AIRPCS_ANA, 0x054, 0x001f0000, 0x00000000 },
++	{ AIRPCS_ANA, 0x054, 0x00001f00, 0x00000000 },
++	{ AIRPCS_ANA, 0x054, 0x0000001f, 0x00000005 },
++	{ AIRPCS_ANA, 0x074, 0x03000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x078, 0x38000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x078, 0x07000000, 0x04000000 },
++	{ AIRPCS_ANA, 0x078, 0x00070000, 0x00040000 },
++	{ AIRPCS_ANA, 0x078, 0x00000700, 0x00000700 },
++	{ AIRPCS_ANA, 0x078, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x798, 0x7fffffff, 0x0a000000 },
++	{ AIRPCS_PMA, 0x794, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x058, 0x000000ff, 0x000000e4 },
++	{ AIRPCS_ANA, 0x054, 0x01000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x05c, 0x00000003, 0x00000001 },
++	{ AIRPCS_ANA, 0x058, 0x03000000, 0x03000000 },
++	{ AIRPCS_ANA, 0x058, 0x00030000, 0x00000000 },
++	{ AIRPCS_ANA, 0x058, 0x00000700, 0x00000400 },
++	{ AIRPCS_ANA, 0x05c, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x05c, 0x00030000, 0x00000000 },
++	{ AIRPCS_ANA, 0x074, 0x00030000, 0x00010000 },
++	{ AIRPCS_ANA, 0x094, 0x0000001f, 0x0000000f },
++	{ AIRPCS_ANA, 0x070, 0x00001f00, 0x00000d00 },
++	{ AIRPCS_ANA, 0x070, 0x00000007, 0x00000003 },
++	{ AIRPCS_ANA, 0x074, 0x00000700, 0x00000000 },
++	{ AIRPCS_ANA, 0x074, 0x00000001, 0x00000001 },
++	{ AIRPCS_ANA, 0x06c, 0x01000000, 0x01000000 },
++	{ AIRPCS_PMA, 0x854, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x854, 0x00000101, 0x00000101 },
++};
++
++static const struct airpcs_step airpcs_txrx[] = {
++	{ AIRPCS_PMA, 0x580, 0x00000003, 0x00000001 },
++	{ AIRPCS_ANA, 0x0c4, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x0c4, 0x00000001, 0x00000001 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000001 },
++	{ AIRPCS_PMA, 0x874, 0x01010000, 0x01010000 },
++	{ AIRPCS_PMA, 0x77c, 0x010f0107, 0x01040000 },
++	{ AIRPCS_PMA, 0x784, 0x00000103, 0x00000101 },
++	{ AIRPCS_PMA, 0x778, 0x011f013f, 0x0100010b },
++	{ AIRPCS_PMA, 0x780, 0x011f013f, 0x00000101 },
++	{ AIRPCS_PMA, 0x260, 0x00000101, 0x00000101 },
++	{ AIRPCS_PMA, 0x178, 0x00070000, 0x00010000 },
++	{ AIRPCS_PMA, 0x374, 0x00000003, 0x00000000 },
++	{ AIRPCS_PMA, 0x184, 0x07ff07ff, 0x040003ff },
++	{ AIRPCS_ANA, 0x148, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x148, 0x00010000, 0x00010000 },
++	{ AIRPCS_ANA, 0x148, 0x00000100, 0x00000100 },
++	{ AIRPCS_ANA, 0x148, 0x00000001, 0x00000001 },
++	{ AIRPCS_ANA, 0x144, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x11c, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x004, 0x00000001, 0x00000001 },
++	{ AIRPCS_ANA, 0x13c, 0x000fff00, 0x00020000 },
++	{ AIRPCS_ANA, 0x120, 0x0003ff00, 0x0003ff00 },
++	{ AIRPCS_PMA, 0x320, 0x01000000, 0x00000000 },
++	{ AIRPCS_PMA, 0x48c, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x0dc, 0x00000100, 0x00000000 },
++	{ AIRPCS_ANA, 0x0dc, 0x00000001, 0x00000000 },
++	{ AIRPCS_PMA, 0x80c, 0x01010000, 0x01000000 },
++	{ AIRPCS_PMA, 0x814, 0x01010000, 0x01010000 },
++	{ AIRPCS_ANA, 0x10c, 0x1f000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x10c, 0x00000004, 0x00000004 },
++	{ AIRPCS_ANA, 0x10c, 0x00000002, 0x00000000 },
++	{ AIRPCS_ANA, 0x10c, 0x00000001, 0x00000000 },
++	{ AIRPCS_PMA, 0x88c, 0x00000103, 0x00000000 },
++	{ AIRPCS_PMA, 0x768, 0x010f0000, 0x00000000 },
++	{ AIRPCS_PMA, 0x79c, 0x0000013f, 0x00000100 },
++	{ AIRPCS_PMA, 0x390, 0x0000ffff, 0x00000001 },
++	{ AIRPCS_PMA, 0x394, 0xffffffff, 0xffff0000 },
++	{ AIRPCS_PMA, 0x39c, 0x00000f00, 0x00000100 },
++	{ AIRPCS_ANA, 0x0d4, 0x07000000, 0x04000000 },
++	{ AIRPCS_ANA, 0x0d4, 0x00700000, 0x00400000 },
++	{ AIRPCS_ANA, 0x0d4, 0x000c0000, 0x00000000 },
++	{ AIRPCS_PMA, 0x100, 0xffffffff, 0x000a0005 },
++	{ AIRPCS_PMA, 0x08c, 0x00ffff07, 0x00000101 },
++	{ AIRPCS_PMA, 0x104, 0x0000ffff, 0x00000002 },
++	{ AIRPCS_PMA, 0x090, 0xffffffff, 0x00320002 },
++	{ AIRPCS_PMA, 0x09c, 0xffffffff, 0x00320002 },
++	{ AIRPCS_PMA, 0x094, 0xffffffff, 0x00320002 },
++	{ AIRPCS_PMA, 0x098, 0xffffffff, 0x00320002 },
++	{ AIRPCS_PMA, 0x76c, 0x01030000, 0x01010000 },
++	{ AIRPCS_ANA, 0x0dc, 0x00000100, 0x00000100 },
++	{ AIRPCS_ANA, 0x0e8, 0x07ffff00, 0x02000000 },
++	{ AIRPCS_ANA, 0x0e8, 0x00000003, 0x00000001 },
++	{ AIRPCS_ANA, 0x0f8, 0x07000000, 0x04000000 },
++	{ AIRPCS_ANA, 0x0f8, 0x000f0000, 0x00010000 },
++	{ AIRPCS_ANA, 0x0f8, 0x00000f00, 0x00000800 },
++	{ AIRPCS_ANA, 0x0f8, 0x0000007f, 0x00000006 },
++	{ AIRPCS_ANA, 0x0fc, 0x03000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x0fc, 0x001f0000, 0x00060000 },
++	{ AIRPCS_ANA, 0x0fc, 0x00000700, 0x00000600 },
++	{ AIRPCS_ANA, 0x0fc, 0x00000007, 0x00000006 },
++	{ AIRPCS_PMA, 0x120, 0x00031f03, 0x00000103 },
++	{ AIRPCS_PMA, 0x088, 0x00000101, 0x00000001 },
++	{ AIRPCS_PMA, 0x38c, 0x00000003, 0x00000001 },
++	{ AIRPCS_PMA, 0x000, 0x01000000, 0x01000000 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x000001f4 },
++	{ AIRPCS_PMA, 0x33c, 0x00000001, 0x00000000 },
++	{ AIRPCS_PMA, 0x330, 0x00000001, 0x00000001 },
++	{ AIRPCS_ANA, 0x118, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x118, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x118, 0x00010000, 0x00010000 },
++	{ AIRPCS_ANA, 0x118, 0x00000100, 0x00000100 },
++	{ AIRPCS_ANA, 0x10c, 0x00080000, 0x00080000 },
++	{ AIRPCS_ANA, 0x10c, 0x00070000, 0x00060000 },
++	{ AIRPCS_PMA, 0x824, 0x01010101, 0x01000100 },
++	{ AIRPCS_PMA, 0x81c, 0x01010101, 0x00000100 },
++	{ AIRPCS_PMA, 0x894, 0x01010101, 0x00000100 },
++	{ AIRPCS_PMA, 0x84c, 0x01010101, 0x01000000 },
++	{ AIRPCS_PMA, 0x34c, 0x01010101, 0x00000000 },
++	{ AIRPCS_ANA, 0x114, 0x001f0000, 0x00060000 },
++	{ AIRPCS_ANA, 0x114, 0x00000300, 0x00000200 },
++	{ AIRPCS_ANA, 0x110, 0x03000000, 0x03000000 },
++	{ AIRPCS_PMA, 0x350, 0x00000001, 0x00000000 },
++	{ AIRPCS_ANA, 0x0d8, 0x01000000, 0x00000000 },
++	{ AIRPCS_ANA, 0x0d8, 0x00010000, 0x00010000 },
++	{ AIRPCS_ANA, 0x0d8, 0x00000300, 0x00000100 },
++	{ AIRPCS_ANA, 0x0d8, 0x000000ff, 0x0000000b },
++	{ AIRPCS_ANA, 0x0cc, 0x01000000, 0x01000000 },
++	{ AIRPCS_ANA, 0x0cc, 0x00010000, 0x00000000 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000064 },
++	{ AIRPCS_PMA, 0x824, 0x00010001, 0x00010001 },
++	{ AIRPCS_PMA, 0x81c, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x894, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x84c, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x34c, 0x01010101, 0x01010101 },
++	{ AIRPCS_PMA, 0x350, 0x00000001, 0x00000001 },
++};
++
++static const struct airpcs_step airpcs_cdr[] = {
++	{ AIRPCS_PMA, 0x818, 0x00000101, 0x00000100 },
++	{ AIRPCS_PMA, 0x818, 0x01010000, 0x01000000 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x000002bc },
++	{ AIRPCS_PMA, 0x818, 0x00010000, 0x00010000 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000064 },
++	{ AIRPCS_PMA, 0x818, 0x00000001, 0x00000001 },
++	{ AIRPCS_PMA, 0x818, 0x01000000, 0x00000000 },
++	{ AIRPCS_PMA, 0x818, 0x00000100, 0x00000000 },
++};
++
++static const struct airpcs_step airpcs_cal_begin[] = {
++	{ AIRPCS_PMA, 0x460, 0x00000020, 0x00000020 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000064 },
++	{ AIRPCS_PMA, 0x150, 0xffffffff, 0xa0649f9c },
++	{ AIRPCS_PMA, 0x14c, 0xffffffff, 0x4e204e20 },
++	{ AIRPCS_PMA, 0x158, 0x0000ff00, 0x00003300 },
++	{ AIRPCS_PMA, 0x154, 0xffffffff, 0xa0649f9c },
++	{ AIRPCS_ANA, 0x0f4, 0x01000000, 0x01000000 },
++	{ AIRPCS_PMA, 0x820, 0x01010101, 0x01010100 },
++	{ AIRPCS_PMA, 0x794, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x824, 0x01000000, 0x01000000 },
++	{ AIRPCS_PMA, 0x824, 0x00010000, 0x00000000 },
++	{ AIRPCS_PMA, 0x824, 0x00010000, 0x00010000 },
++};
++
++static const struct airpcs_step airpcs_global_reset[] = {
++	{ AIRPCS_PMA, 0x460, 0x00000fff, 0x00000020 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000064 },
++	{ AIRPCS_PMA, 0x460, 0x00000fff, 0x00000fff },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00001388 },
++};
++
++static const struct airpcs_step airpcs_cal_finish[] = {
++	{ AIRPCS_ANA, 0x0f4, 0x01000000, 0x00000000 },
++	{ AIRPCS_PMA, 0x820, 0x00000100, 0x00000000 },
++	{ AIRPCS_PMA, 0x794, 0x00010000, 0x00000000 },
++	{ AIRPCS_PMA, 0x19c, 0x00000001, 0x00000001 },
++};
++
++static const struct airpcs_step airpcs_cal_release[] = {
++	{ AIRPCS_PMA, 0x824, 0x00010000, 0x00000000 },
++	{ AIRPCS_PMA, 0x824, 0x00010000, 0x00010000 },
++	{ AIRPCS_PMA, 0x824, 0x01000000, 0x00000000 },
++	{ AIRPCS_PMA, 0x460, 0x00000020, 0x00000000 },
++	{ AIRPCS_DELAY, 0x000, 0x00000000, 0x00000064 },
++};
++
+diff --git a/dev/fdt/airpcsvar.h b/dev/fdt/airpcsvar.h
+new file mode 100644
+index 0000000..2585d97
+--- /dev/null
++++ b/dev/fdt/airpcsvar.h
+@@ -0,0 +1,31 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _DEV_FDT_AIRPCSVAR_H_
++#define _DEV_FDT_AIRPCSVAR_H_
++
++struct airpcs_softc;
++
++struct airpcs_softc *airpcs_by_node(int);
++/* Initialization can sleep; call at IPL_NONE before exposing the interface. */
++int	airpcs_init(struct airpcs_softc *);
++/* Poll/link control does not sleep and is serialized by the provider. */
++int	airpcs_poll(struct airpcs_softc *, int);
++void	airpcs_down(struct airpcs_softc *);
++void	airpcs_dump(struct airpcs_softc *);
++
++#endif
+diff --git a/dev/fdt/airscu.c b/dev/fdt/airscu.c
+new file mode 100644
+index 0000000..a70b5ae
+--- /dev/null
++++ b/dev/fdt/airscu.c
+@@ -0,0 +1,209 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * Airoha EN7581 System Control Unit.  Only the reset controller is
++ * implemented; the clocks are left as configured by the firmware.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/device.h>
++
++#include <machine/intr.h>
++#include <machine/bus.h>
++#include <machine/fdt.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_clock.h>
++#include <dev/ofw/ofw_misc.h>
++#include <dev/ofw/fdt.h>
++
++/* Registers */
++#define SCU_PCIC		0x0088
++#define SCU_RST_CTRL2		0x0830
++#define SCU_RST_CTRL1		0x0834
++
++#define HREAD4(sc, reg)							\
++	(bus_space_read_4((sc)->sc_iot, (sc)->sc_ioh, (reg)))
++#define HWRITE4(sc, reg, val)						\
++	bus_space_write_4((sc)->sc_iot, (sc)->sc_ioh, (reg), (val))
++
++/*
++ * Map from the reset index used in the device tree to the register
++ * bit.  Bits 0-31 live in RST_CTRL2, bits 32-63 in RST_CTRL1 and bits
++ * 64-95 in PCIC (where the polarity is inverted).
++ */
++const uint8_t airscu_en7581_resets[] = {
++	/* RST_CTRL2 */
++	0,		/* XPON_PHY */
++	2,		/* CPU_TIMER2 */
++	3,		/* HSUART */
++	4,		/* UART4 */
++	5,		/* UART5 */
++	6,		/* I2C2 */
++	7,		/* XSI_MAC */
++	8,		/* XSI_PHY */
++	9,		/* NPU */
++	10,		/* I2S */
++	11,		/* TRNG */
++	12,		/* TRNG_MSTART */
++	13,		/* DUAL_HSI0 */
++	14,		/* DUAL_HSI1 */
++	15,		/* HSI */
++	16,		/* DUAL_HSI0_MAC */
++	17,		/* DUAL_HSI1_MAC */
++	18,		/* HSI_MAC */
++	19,		/* WDMA */
++	20,		/* WOE0 */
++	21,		/* WOE1 */
++	22,		/* HSDMA */
++	24,		/* TDMA */
++	25,		/* EMMC */
++	26,		/* SOE */
++	27,		/* PCIE2 */
++	28,		/* XFP_MAC */
++	29,		/* USB_HOST_P1 */
++	30,		/* USB_HOST_P1_U3_PHY */
++	/* RST_CTRL1 */
++	32 + 0,		/* PCM1_ZSI_ISI */
++	32 + 1,		/* FE_PDMA */
++	32 + 2,		/* FE_QDMA */
++	32 + 4,		/* PCM_SPIWP */
++	32 + 6,		/* CRYPTO */
++	32 + 8,		/* TIMER */
++	32 + 11,	/* PCM1 */
++	32 + 12,	/* UART */
++	32 + 13,	/* GPIO */
++	32 + 14,	/* GDMA */
++	32 + 16,	/* I2C_MASTER */
++	32 + 17,	/* PCM2_ZSI_ISI */
++	32 + 18,	/* SFC */
++	32 + 19,	/* UART2 */
++	32 + 20,	/* GDMP */
++	32 + 21,	/* FE */
++	32 + 22,	/* USB_HOST_P0 */
++	32 + 23,	/* GSW */
++	32 + 25,	/* SFC2_PCM */
++	32 + 26,	/* PCIE0 */
++	32 + 27,	/* PCIE1 */
++	32 + 28,	/* CPU_TIMER */
++	32 + 29,	/* PCIE_HB */
++	32 + 31,	/* XPON_MAC */
++	/* PCIC */
++	64 + 29,	/* PCIC_PERSTOUT0 */
++	64 + 26,	/* PCIC_PERSTOUT1 */
++	64 + 16,	/* PCIC_PERSTOUT2 */
++};
++
++struct airscu_softc {
++	struct device		sc_dev;
++	bus_space_tag_t		sc_iot;
++	bus_space_handle_t	sc_ioh;
++
++	struct reset_device	sc_rd;
++};
++
++int	airscu_match(struct device *, void *, void *);
++void	airscu_attach(struct device *, struct device *, void *);
++
++const struct cfattach airscu_ca = {
++	sizeof (struct airscu_softc), airscu_match, airscu_attach
++};
++
++struct cfdriver airscu_cd = {
++	NULL, "airscu", DV_DULL
++};
++
++void	airscu_reset(void *, uint32_t *, int);
++
++int
++airscu_match(struct device *parent, void *match, void *aux)
++{
++	struct fdt_attach_args *faa = aux;
++
++	/* Take precedence over syscon(4). */
++	if (OF_is_compatible(faa->fa_node, "airoha,en7581-scu"))
++		return 10;
++	return 0;
++}
++
++void
++airscu_attach(struct device *parent, struct device *self, void *aux)
++{
++	struct airscu_softc *sc = (struct airscu_softc *)self;
++	struct fdt_attach_args *faa = aux;
++
++	if (faa->fa_nreg < 1) {
++		printf(": no registers\n");
++		return;
++	}
++
++	sc->sc_iot = faa->fa_iot;
++	if (bus_space_map(sc->sc_iot, faa->fa_reg[0].addr,
++	    faa->fa_reg[0].size, 0, &sc->sc_ioh)) {
++		printf(": can't map registers\n");
++		return;
++	}
++
++	printf("\n");
++
++	/* Other drivers poke at SCU registers through the regmap. */
++	regmap_register(faa->fa_node, sc->sc_iot, sc->sc_ioh,
++	    faa->fa_reg[0].size);
++
++	sc->sc_rd.rd_node = faa->fa_node;
++	sc->sc_rd.rd_cookie = sc;
++	sc->sc_rd.rd_reset = airscu_reset;
++	reset_register(&sc->sc_rd);
++}
++
++void
++airscu_reset(void *cookie, uint32_t *cells, int assert)
++{
++	struct airscu_softc *sc = cookie;
++	uint32_t idx = cells[0];
++	bus_size_t reg;
++	uint32_t bit, val;
++
++	if (idx >= nitems(airscu_en7581_resets)) {
++		printf("%s: 0x%08x\n", __func__, idx);
++		return;
++	}
++
++	bit = airscu_en7581_resets[idx];
++	switch (bit / 32) {
++	case 0:
++		reg = SCU_RST_CTRL2;
++		break;
++	case 1:
++		reg = SCU_RST_CTRL1;
++		break;
++	default:
++		reg = SCU_PCIC;
++		assert = !assert;
++		break;
++	}
++	bit = 1U << (bit % 32);
++
++	val = HREAD4(sc, reg);
++	if (assert)
++		val |= bit;
++	else
++		val &= ~bit;
++	HWRITE4(sc, reg, val);
++}
+diff --git a/dev/fdt/airsw.c b/dev/fdt/airsw.c
+new file mode 100644
+index 0000000..be38e4c
+--- /dev/null
++++ b/dev/fdt/airsw.c
+@@ -0,0 +1,641 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * Airoha EN7581 built-in gigabit switch (MT7531 derivative).  The
++ * hardware is configured as an unmanaged switch that forwards packets
++ * between all ports, including the CPU port connected to GDM1 of
++ * aireth(4).
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/device.h>
++#include <sys/timeout.h>
++
++#include <machine/bus.h>
++#include <machine/fdt.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_clock.h>
++#include <dev/ofw/ofw_misc.h>
++#include <dev/ofw/fdt.h>
++
++#include <dev/mii/mii.h>
++#include <dev/fdt/airmdio.h>
++
++/* Registers */
++#define AIRSW_MFC			0x0010
++#define  AIRSW_MFC_BC_FFP_MASK		(0xffU << 24)
++#define  AIRSW_MFC_UNM_FFP_MASK		(0xffU << 16)
++#define  AIRSW_MFC_UNU_FFP_MASK		(0xffU << 8)
++#define AIRSW_PMSR(x)			(0x3008 + (x) * 0x100)
++#define  AIRSW_PMSR_SPEED_1000		(1U << 3)
++#define  AIRSW_PMSR_SPEED_100		(1U << 2)
++#define  AIRSW_PMSR_DPX			(1U << 1)
++#define  AIRSW_PMSR_LINK		(1U << 0)
++#define AIRSW_MIB(x)			(0x4000 + (x) * 0x100)
++#define  AIRSW_MIB_TX_DROP		0x00
++#define  AIRSW_MIB_TX_UNICAST		0x08
++#define  AIRSW_MIB_TX_MULTICAST		0x0c
++#define  AIRSW_MIB_TX_BROADCAST		0x10
++#define  AIRSW_MIB_RX_DROP		0x60
++#define  AIRSW_MIB_RX_FILTERING		0x64
++#define  AIRSW_MIB_RX_UNICAST		0x68
++#define  AIRSW_MIB_RX_MULTICAST		0x6c
++#define  AIRSW_MIB_RX_BROADCAST		0x70
++#define  AIRSW_MIB_RX_CRC_ERR		0x78
++#define  AIRSW_MIB_RX_INGRESS_DROP	0xb4
++#define  AIRSW_MIB_RX_ARL_DROP		0xb8
++#define AIRSW_MIB_CCR			0x4fe0
++#define  AIRSW_MIB_CCR_FLUSH		0x000000f0
++#define  AIRSW_MIB_CCR_ACTIVATE		0x800000f0
++#define AIRSW_PMCR(x)			(0x3000 + (x) * 0x100)
++#define  AIRSW_PMCR_IPG_SHORT		(1U << 18)
++#define  AIRSW_PMCR_MAC_MODE		(1U << 16)
++#define  AIRSW_PMCR_FORCE_MODE		(1U << 15)
++#define  AIRSW_PMCR_MAC_TX_EN		(1U << 14)
++#define  AIRSW_PMCR_MAC_RX_EN		(1U << 13)
++#define  AIRSW_PMCR_BKOFF_EN		(1U << 9)
++#define  AIRSW_PMCR_BKPR_EN		(1U << 8)
++#define  AIRSW_PMCR_FORCE_RX_FC		(1U << 5)
++#define  AIRSW_PMCR_FORCE_TX_FC		(1U << 4)
++#define  AIRSW_PMCR_FORCE_SPD_1000	(2U << 2)
++#define  AIRSW_PMCR_FORCE_SPD_100		(1U << 2)
++#define  AIRSW_PMCR_FORCE_DPX		(1U << 1)
++#define  AIRSW_PMCR_FORCE_LNK		(1U << 0)
++#define AIRSW_SYS_CTRL			0x7000
++#define  AIRSW_SYS_CTRL_PHY_RST		(1U << 2)
++#define AIRSW_PHY_POLL			0x7018
++#define  AIRSW_PHY_POLL_AP_EN(x)	((x) << 24)
++#define  AIRSW_PHY_POLL_EEE_EN(x)	((x) << 16)
++#define  AIRSW_PHY_POLL_PRE_EN		(1U << 15)
++#define  AIRSW_PHY_POLL_END_ADDR(x)	((x) << 8)
++#define  AIRSW_PHY_POLL_ST_ADDR(x)	((x) << 0)
++#define AIRSW_PHY_IAC			0x701c
++#define  AIRSW_PHY_IAC_ACS_ST		(1U << 31)
++#define  AIRSW_PHY_IAC_REG(x)		((x) << 25)
++#define  AIRSW_PHY_IAC_PHY(x)		((x) << 20)
++#define  AIRSW_PHY_IAC_C22_WRITE	(0x5U << 16)
++#define  AIRSW_PHY_IAC_C22_READ		(0x9U << 16)
++#define  AIRSW_PHY_IAC_DATA_MASK	0xffff
++#define AIRSW_CREV			0x7ffc
++
++#define AIRSW_CFC		0x0004
++#define AIRSW_ATC		0x0080
++#define AIRSW_ATC_BUSY		(1U << 15)
++#define AIRSW_ATC_FLUSH		2
++#define AIRSW_SSP(p)		(0x2000 + (p) * 0x100)
++#define AIRSW_PCR(p)		(0x2004 + (p) * 0x100)
++#define AIRSW_PSC(p)		(0x200c + (p) * 0x100)
++#define AIRSW_PVC(p)		(0x2010 + (p) * 0x100)
++#define AIRSW_PVID(p)		(0x2014 + (p) * 0x100)
++#define AIRSW_GMACCR		0x30e0
++#define AIRSW_INT_EN		0x7008
++#define AIRSW_CPORT_TAG		0x7c10
++#define AIRSW_NPORTS		7
++#define AIRSW_PHY_ID		0x03a294c0
++#define AIRSW_MAC_BASE		(AIRSW_PMCR_IPG_SHORT | \
++    AIRSW_PMCR_MAC_MODE | AIRSW_PMCR_FORCE_MODE | \
++    AIRSW_PMCR_BKOFF_EN | AIRSW_PMCR_BKPR_EN)
++
++#define AIRSW_CPU_PORT			6
++
++#define HREAD4(sc, reg)							\
++	(bus_space_read_4((sc)->sc_iot, (sc)->sc_ioh, (reg)))
++#define HWRITE4(sc, reg, val)						\
++	bus_space_write_4((sc)->sc_iot, (sc)->sc_ioh, (reg), (val))
++#define HSET4(sc, reg, bits)						\
++	HWRITE4((sc), (reg), HREAD4((sc), (reg)) | (bits))
++
++struct airsw_softc {
++	struct device		sc_dev;
++	bus_space_tag_t		sc_iot;
++	bus_space_handle_t	sc_ioh;
++	int			sc_mdio_node;
++	struct air_mdio		sc_mdio;
++	struct timeout		sc_tick;
++	int			sc_gdmnode;
++	int			sc_ready;
++	uint32_t		sc_ports;
++	int			sc_phy[AIRSW_NPORTS];
++	uint32_t		sc_pmcr[AIRSW_NPORTS];
++};
++
++int	airsw_match(struct device *, void *, void *);
++void	airsw_attach(struct device *, struct device *, void *);
++
++const struct cfattach airsw_ca = {
++	sizeof (struct airsw_softc), airsw_match, airsw_attach
++};
++
++struct cfdriver airsw_cd = {
++	NULL, "airsw", DV_DULL
++};
++
++int	airsw_phy_wait(struct airsw_softc *);
++int	airsw_phy_read(void *, int, int);
++int	airsw_phy_write(void *, int, int, int);
++int	airsw_phy_enable(struct airsw_softc *, int);
++int	airsw_topology(struct airsw_softc *, int);
++int	airsw_init(struct airsw_softc *);
++int	airsw_wait(struct airsw_softc *, unsigned int, uint32_t);
++void	airsw_block(struct airsw_softc *);
++void	airsw_tick(void *);
++void	airsw_dump(void);
++
++int
++airsw_match(struct device *parent, void *match, void *aux)
++{
++	struct fdt_attach_args *faa = aux;
++
++	return OF_is_compatible(faa->fa_node, "airoha,en7581-switch");
++}
++
++void
++airsw_attach(struct device *parent, struct device *self, void *aux)
++{
++	struct airsw_softc *sc = (struct airsw_softc *)self;
++	struct fdt_attach_args *faa = aux;
++	uint32_t resets[2], rev;
++	int error;
++
++	if (faa->fa_nreg < 1 || faa->fa_reg[0].size < 0x8000) {
++		printf(": missing or short registers\n");
++		return;
++	}
++	if (OF_getpropintarray(faa->fa_node, "resets", resets,
++	    sizeof(resets)) != sizeof(resets) || resets[1] != 46 ||
++	    regmap_byphandle(resets[0]) == NULL) {
++		printf(": missing GSW reset controller\n");
++		return;
++	}
++	if ((error = airsw_topology(sc, faa->fa_node)) != 0) {
++		printf(": invalid LAN topology: %d\n", error);
++		return;
++	}
++	sc->sc_iot = faa->fa_iot;
++	if (bus_space_map(sc->sc_iot, faa->fa_reg[0].addr,
++	    faa->fa_reg[0].size, 0, &sc->sc_ioh)) {
++		printf(": can't map registers\n");
++		return;
++	}
++	reset_assert_all(faa->fa_node);
++	delay(50);
++	reset_deassert_all(faa->fa_node);
++	delay(50);
++	rev = HREAD4(sc, AIRSW_CREV);
++	if ((rev >> 16) != 0x7530) {
++		printf(": unexpected revision 0x%08x\n", rev);
++		bus_space_unmap(sc->sc_iot, sc->sc_ioh, faa->fa_reg[0].size);
++		return;
++	}
++	printf(": rev 0x%08x, native LAN switch\n", rev);
++	mtx_init(&sc->sc_mdio.am_lock, IPL_NET);
++	sc->sc_mdio.am_cookie = sc;
++	sc->sc_mdio.am_read = airsw_phy_read;
++	sc->sc_mdio.am_write = airsw_phy_write;
++
++	/* Publish MDIO independently of whether the LAN PHYs initialize. */
++	sc->sc_mdio_node = OF_getnodebyname(faa->fa_node, "mdio");
++	error = airsw_init(sc);
++	if (error) {
++		airsw_block(sc);
++		printf("%s: LAN initialization failed: %d\n",
++		    sc->sc_dev.dv_xname, error);
++		return;
++	}
++	sc->sc_ready = 1;
++	timeout_set(&sc->sc_tick, airsw_tick, sc);
++	airsw_tick(sc);
++}
++
++int
++airsw_phy_wait(struct airsw_softc *sc)
++{
++	uint32_t val;
++	int timo;
++
++	for (timo = 1000; timo > 0; timo--) {
++		val = HREAD4(sc, AIRSW_PHY_IAC);
++		if ((val & AIRSW_PHY_IAC_ACS_ST) == 0)
++			return (val & AIRSW_PHY_IAC_DATA_MASK);
++		delay(20);
++	}
++
++	printf("%s: PHY access timeout\n", sc->sc_dev.dv_xname);
++	return -1;
++}
++
++int
++airsw_phy_read(void *cookie, int phy, int reg)
++{
++	struct airsw_softc *sc = cookie;
++
++	MUTEX_ASSERT_LOCKED(&sc->sc_mdio.am_lock);
++	if (phy < 0 || phy > 31 || reg < 0 || reg > 31)
++		return -1;
++	if (airsw_phy_wait(sc) == -1)
++		return -1;
++
++	HWRITE4(sc, AIRSW_PHY_IAC, AIRSW_PHY_IAC_ACS_ST |
++	    AIRSW_PHY_IAC_C22_READ | AIRSW_PHY_IAC_PHY(phy) |
++	    AIRSW_PHY_IAC_REG(reg));
++
++	return airsw_phy_wait(sc);
++}
++
++int
++airsw_phy_write(void *cookie, int phy, int reg, int val)
++{
++	struct airsw_softc *sc = cookie;
++
++	MUTEX_ASSERT_LOCKED(&sc->sc_mdio.am_lock);
++	if (phy < 0 || phy > 31 || reg < 0 || reg > 31)
++		return EINVAL;
++	if (airsw_phy_wait(sc) == -1)
++		return EIO;
++
++	HWRITE4(sc, AIRSW_PHY_IAC, AIRSW_PHY_IAC_ACS_ST |
++	    AIRSW_PHY_IAC_C22_WRITE | AIRSW_PHY_IAC_PHY(phy) |
++	    AIRSW_PHY_IAC_REG(reg) | (val & AIRSW_PHY_IAC_DATA_MASK));
++
++	return airsw_phy_wait(sc) == -1 ? EIO : 0;
++}
++
++/* Parse only enabled internal ports; never guess the board's wiring. */
++int
++airsw_topology(struct airsw_softc *sc, int node)
++{
++	uint32_t used = 0;
++	int ports, port, p, phy, phynode, fixed, bus;
++	char mode[16];
++
++	for (p = 0; p < AIRSW_NPORTS; p++)
++		sc->sc_phy[p] = -1;
++	ports = OF_getnodebyname(node, "ports");
++	bus = OF_getnodebyname(node, "mdio");
++	if (!ports || !OF_is_enabled(ports) || !bus || !OF_is_enabled(bus))
++		return ENODEV;
++	for (port = OF_child(ports); port; port = OF_peer(port)) {
++		if (!OF_is_enabled(port))
++			continue;
++		p = OF_getpropint(port, "reg", -1);
++		if (p < 0 || p >= AIRSW_NPORTS || (used & (1U << p)))
++			return EINVAL;
++		used |= 1U << p;
++		memset(mode, 0, sizeof(mode));
++		OF_getprop(port, "phy-mode", mode, sizeof(mode) - 1);
++		if (strcmp(mode, "internal"))
++			return EINVAL;
++		if (p == AIRSW_CPU_PORT) {
++			sc->sc_gdmnode = OF_getnodebyphandle(
++			    OF_getpropint(port, "ethernet", 0));
++			fixed = OF_getnodebyname(port, "fixed-link");
++			if (!sc->sc_gdmnode || !OF_is_enabled(sc->sc_gdmnode) ||
++			    !fixed || OF_getpropint(fixed, "speed", 0) != 10000 ||
++			    OF_getproplen(fixed, "full-duplex") != 0)
++				return EINVAL;
++			continue;
++		}
++		/* EN7581's internal copper ports are 0..4, PHY addresses 8..12. */
++		if (p > 4)
++			return EINVAL;
++		phynode = OF_getnodebyphandle(
++		    OF_getpropint(port, "phy-handle", 0));
++		if (!phynode || !OF_is_enabled(phynode) || OF_parent(phynode) != bus)
++			return EINVAL;
++		phy = OF_getpropint(phynode, "reg", -1);
++		if (phy != p + 8)
++			return EINVAL;
++		sc->sc_phy[p] = phy;
++		sc->sc_ports |= 1U << p;
++	}
++	return sc->sc_gdmnode && sc->sc_ports ? 0 : ENODEV;
++}
++
++int
++airsw_wait(struct airsw_softc *sc, unsigned int reg, uint32_t mask)
++{
++	uint32_t value;
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		value = HREAD4(sc, reg);
++		if (value == 0xdeadbeef || value == 0xffffffff)
++			return EIO;
++		if (!(value & mask))
++			return 0;
++		delay(10);
++	}
++	return ETIMEDOUT;
++}
++
++/* Keep disabled ports out of every forwarding path, even on partial failure. */
++void
++airsw_block(struct airsw_softc *sc)
++{
++	int p;
++
++	HWRITE4(sc, AIRSW_PHY_POLL, 0);
++	HWRITE4(sc, AIRSW_INT_EN, 0);
++	HWRITE4(sc, AIRSW_MFC, 0);
++	for (p = 0; p < AIRSW_NPORTS; p++) {
++		HWRITE4(sc, AIRSW_PMCR(p), AIRSW_MAC_BASE);
++		sc->sc_pmcr[p] = AIRSW_MAC_BASE;
++		HWRITE4(sc, AIRSW_PCR(p), 0);
++		HWRITE4(sc, AIRSW_SSP(p), 0);
++		HWRITE4(sc, AIRSW_PSC(p), 1U << 4); /* disable learning */
++	}
++}
++
++int
++airsw_init(struct airsw_softc *sc)
++{
++	uint32_t members, value;
++	int p, error;
++
++	airsw_block(sc);
++	HWRITE4(sc, AIRSW_SYS_CTRL, AIRSW_SYS_CTRL_PHY_RST);
++	delay(1000);
++	HWRITE4(sc, AIRSW_ATC, AIRSW_ATC_BUSY | AIRSW_ATC_FLUSH);
++	if ((error = airsw_wait(sc, AIRSW_ATC, AIRSW_ATC_BUSY)) != 0)
++		return error;
++	for (p = 0; p < AIRSW_NPORTS; p++) {
++		if (!(sc->sc_ports & (1U << p)))
++			continue;
++		error = airsw_phy_enable(sc, sc->sc_phy[p]);
++		if (error) {
++			printf("%s: port %d PHY initialization failed: %d\n",
++			    sc->sc_dev.dv_xname, p, error);
++			sc->sc_ports &= ~(1U << p);
++		}
++	}
++	if (!sc->sc_ports)
++		return ENODEV;
++	members = sc->sc_ports | (1U << AIRSW_CPU_PORT);
++	/* Raw Ethernet on the CPU link, matching GDM1's disabled STAG mode. */
++	HWRITE4(sc, AIRSW_CPORT_TAG, 0);
++	HWRITE4(sc, AIRSW_CFC, 1U << AIRSW_CPU_PORT);
++	HWRITE4(sc, AIRSW_MFC,
++	    (members << 24) | (members << 16) | (members << 8) | members);
++	/* Trap reserved link-local traffic to the CPU, preserving VLAN tags. */
++	HWRITE4(sc, 0x24, 0x02060006);
++	HWRITE4(sc, 0x28, 0x02060206);
++	HWRITE4(sc, 0x2c, 0x02060206);
++	/* 1536-byte frames cover Ethernet plus VLAN tags; no jumbo mode. */
++	value = HREAD4(sc, AIRSW_GMACCR);
++	if (value == 0xdeadbeef || value == 0xffffffff)
++		return EIO;
++	HWRITE4(sc, AIRSW_GMACCR, (value & ~0x3fU) | 1);
++	for (p = 0; p < AIRSW_NPORTS; p++) {
++		/* Transparent VLAN handling, no switch header or tag rewriting. */
++		HWRITE4(sc, AIRSW_PVC(p), 0x810000c0);
++		HWRITE4(sc, AIRSW_PVID(p), 1);
++		if (!(members & (1U << p)))
++			continue;
++		HWRITE4(sc, AIRSW_SSP(p), 0xf); /* FID0/1 forwarding */
++		HWRITE4(sc, AIRSW_PSC(p), 0); /* source address learning */
++		HWRITE4(sc, AIRSW_PCR(p), (members & ~(1U << p)) << 16);
++	}
++	HWRITE4(sc, AIRSW_MIB_CCR, AIRSW_MIB_CCR_FLUSH);
++	HWRITE4(sc, AIRSW_MIB_CCR, AIRSW_MIB_CCR_ACTIVATE);
++	sc->sc_pmcr[AIRSW_CPU_PORT] = AIRSW_MAC_BASE |
++	    AIRSW_PMCR_MAC_TX_EN | AIRSW_PMCR_MAC_RX_EN |
++	    AIRSW_PMCR_FORCE_RX_FC | AIRSW_PMCR_FORCE_TX_FC |
++	    AIRSW_PMCR_FORCE_SPD_1000 | AIRSW_PMCR_FORCE_DPX | AIRSW_PMCR_FORCE_LNK;
++	HWRITE4(sc, AIRSW_PMCR(AIRSW_CPU_PORT), sc->sc_pmcr[AIRSW_CPU_PORT]);
++	return 0;
++}
++
++/* Internal AN7581 PHYs need no firmware or vendor analog calibration. */
++int
++airsw_phy_enable(struct airsw_softc *sc, int phy)
++{
++	int id1, id2, first1, first2, val, i, error = 0;
++
++	if (phy < 8 || phy > 12)
++		return EINVAL;
++	mtx_enter(&sc->sc_mdio.am_lock);
++	if ((error = airsw_phy_write(sc, phy, 31, 0)) != 0)
++		goto out;
++	id1 = airsw_phy_read(sc, phy, MII_PHYIDR1);
++	id2 = airsw_phy_read(sc, phy, MII_PHYIDR2);
++	first1 = id1;
++	first2 = id2;
++	if (id1 < 0 || id2 < 0) {
++		error = EIO;
++		goto out;
++	}
++	for (i = 0; i < 100 &&
++	    (((uint32_t)id1 << 16) | (id2 & ~0xfU)) != AIRSW_PHY_ID; i++) {
++		delay(10000);
++		id1 = airsw_phy_read(sc, phy, MII_PHYIDR1);
++		id2 = airsw_phy_read(sc, phy, MII_PHYIDR2);
++		if (id1 < 0 || id2 < 0) {
++			error = EIO;
++			goto out;
++		}
++	}
++	if ((((uint32_t)id1 << 16) | (id2 & ~0xfU)) != AIRSW_PHY_ID) {
++		printf("%s: PHY address %d ID %04x:%04x (initial %04x:%04x)\n",
++		    sc->sc_dev.dv_xname, phy, id1, id2, first1, first2);
++		error = ENODEV;
++		goto out;
++	}
++	if (i != 0)
++		printf("%s: PHY address %d ID appeared after %d retries "
++		    "(%04x:%04x -> %04x:%04x)\n", sc->sc_dev.dv_xname, phy,
++		    i, first1, first2, id1, id2);
++	error = airsw_phy_write(sc, phy, MII_BMCR, BMCR_RESET);
++	mtx_leave(&sc->sc_mdio.am_lock);
++	if (error)
++		return error;
++	for (i = 0; i < 100; i++) {
++		delay(1000);
++		mtx_enter(&sc->sc_mdio.am_lock);
++		val = airsw_phy_read(sc, phy, MII_BMCR);
++		mtx_leave(&sc->sc_mdio.am_lock);
++		if (val < 0 || val == 0xffff)
++			return EIO;
++		if (!(val & BMCR_RESET))
++			break;
++	}
++	if (i == 100)
++		return ETIMEDOUT;
++	mtx_enter(&sc->sc_mdio.am_lock);
++	/* Disable EEE advertisement via the standard indirect MMD registers. */
++	if ((error = airsw_phy_write(sc, phy, 13, 7)) ||
++	    (error = airsw_phy_write(sc, phy, 14, 0x3c)) ||
++	    (error = airsw_phy_write(sc, phy, 13, 0x4007)) ||
++	    (error = airsw_phy_write(sc, phy, 14, 0)) ||
++	    (error = airsw_phy_write(sc, phy, MII_ANAR,
++	    ANAR_CSMA | ANAR_TX_FD | ANAR_TX | ANAR_10_FD | ANAR_10 |
++	    ANAR_PAUSE_SYM | ANAR_PAUSE_ASYM)) ||
++	    (error = airsw_phy_write(sc, phy, MII_100T2CR, GTCR_ADV_1000TFDX)) ||
++	    (error = airsw_phy_write(sc, phy, MII_BMCR, BMCR_AUTOEN | BMCR_STARTNEG)))
++		goto out;
++out:
++	mtx_leave(&sc->sc_mdio.am_lock);
++	return error;
++}
++
++/* Force each user MAC from fresh copper status, not Linux's link settings. */
++void
++airsw_tick(void *arg)
++{
++	struct airsw_softc *sc = arg;
++	uint32_t mcr;
++	int p, phy, status, gig, giglocal, partner, local;
++
++	for (p = 0; p < AIRSW_NPORTS; p++) {
++		if (!(sc->sc_ports & (1U << p)))
++			continue;
++		mcr = AIRSW_MAC_BASE;
++		phy = sc->sc_phy[p];
++		mtx_enter(&sc->sc_mdio.am_lock);
++		if (airsw_phy_write(sc, phy, 31, 0))
++			goto invalid;
++		status = airsw_phy_read(sc, phy, MII_BMSR);
++		if (status <= 0 || status == 0xffff)
++			goto invalid;
++		status = airsw_phy_read(sc, phy, MII_BMSR);
++		if (status <= 0 || status == 0xffff)
++			goto invalid;
++		if ((status & (BMSR_LINK | BMSR_ACOMP)) != (BMSR_LINK | BMSR_ACOMP))
++			goto next;
++		gig = airsw_phy_read(sc, phy, MII_100T2SR);
++		giglocal = airsw_phy_read(sc, phy, MII_100T2CR);
++		partner = airsw_phy_read(sc, phy, MII_ANLPAR);
++		local = airsw_phy_read(sc, phy, MII_ANAR);
++		if (gig <= 0 || gig == 0xffff || giglocal <= 0 || giglocal == 0xffff ||
++		    partner <= 0 || partner == 0xffff ||
++		    local <= 0 || local == 0xffff)
++			goto invalid;
++		if ((gig & GTSR_LP_1000TFDX) && (giglocal & GTCR_ADV_1000TFDX))
++			mcr |= AIRSW_PMCR_FORCE_SPD_1000 | AIRSW_PMCR_FORCE_DPX;
++		else if (local & partner & ANAR_TX_FD)
++			mcr |= AIRSW_PMCR_FORCE_SPD_100 | AIRSW_PMCR_FORCE_DPX;
++		else if (local & partner & ANAR_TX)
++			mcr |= AIRSW_PMCR_FORCE_SPD_100;
++		else if (local & partner & ANAR_10_FD)
++			mcr |= AIRSW_PMCR_FORCE_DPX;
++		else if (!(local & partner & ANAR_10))
++			goto invalid;
++		if ((mcr & AIRSW_PMCR_FORCE_DPX) && (local & partner & ANAR_PAUSE_SYM))
++			mcr |= AIRSW_PMCR_FORCE_RX_FC | AIRSW_PMCR_FORCE_TX_FC;
++		else if ((mcr & AIRSW_PMCR_FORCE_DPX) &&
++		    (local & partner & ANAR_PAUSE_ASYM)) {
++			if (local & ANAR_PAUSE_SYM)
++				mcr |= AIRSW_PMCR_FORCE_RX_FC;
++			else if (partner & ANAR_PAUSE_SYM)
++				mcr |= AIRSW_PMCR_FORCE_TX_FC;
++		}
++		mcr |= AIRSW_PMCR_MAC_TX_EN | AIRSW_PMCR_MAC_RX_EN | AIRSW_PMCR_FORCE_LNK;
++		goto next;
++invalid:
++		/* A failed MDIO read must not tear down an established link. */
++		mcr = sc->sc_pmcr[p];
++next:
++		mtx_leave(&sc->sc_mdio.am_lock);
++		if (mcr != sc->sc_pmcr[p]) {
++			HWRITE4(sc, AIRSW_PMCR(p), mcr);
++			sc->sc_pmcr[p] = mcr;
++		}
++	}
++	if (sc->sc_ready)
++		timeout_add_sec(&sc->sc_tick, 1);
++}
++
++int
++airsw_lan_ready(int gdmnode)
++{
++	struct airsw_softc *sc;
++	int i;
++
++	if (!gdmnode)
++		return 0;
++	for (i = 0; i < airsw_cd.cd_ndevs; i++) {
++		sc = airsw_cd.cd_devs[i];
++		if (sc && sc->sc_ready && sc->sc_gdmnode == gdmnode)
++			return 1;
++	}
++	return 0;
++}
++
++/*
++ * Link state and MIB counters of the user ports and the CPU port, for
++ * aireth_dump().
++ */
++void
++airsw_dump(void)
++{
++	struct airsw_softc *sc;
++	uint32_t st;
++	int port;
++
++	if (airsw_cd.cd_ndevs < 1 || airsw_cd.cd_devs[0] == NULL)
++		return;
++	sc = airsw_cd.cd_devs[0];
++	if (!sc->sc_mdio_node)
++		return;
++	printf("%s: LAN ready %d members 0x%x cpu-tag 0x%08x\n",
++	    sc->sc_dev.dv_xname, sc->sc_ready, sc->sc_ports,
++	    HREAD4(sc, AIRSW_CPORT_TAG));
++
++	for (port = 0; port <= AIRSW_CPU_PORT; port++) {
++		if (port == 5)
++			continue;
++		st = HREAD4(sc, AIRSW_PMSR(port));
++		printf("%s: port %d %s%s rx uc %u mc %u bc %u "
++		    "drop %u filt %u crc %u ingr %u arl %u | "
++		    "tx uc %u mc %u bc %u drop %u\n", sc->sc_dev.dv_xname, port,
++		    (st & AIRSW_PMSR_LINK) ? "up" : "down",
++		    (st & AIRSW_PMSR_LINK) ?
++		    ((st & AIRSW_PMSR_SPEED_1000) ? " 1000" :
++		    (st & AIRSW_PMSR_SPEED_100) ? " 100" : " 10") : "",
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_UNICAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_MULTICAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_BROADCAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_DROP),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_FILTERING),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_CRC_ERR),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_INGRESS_DROP),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_RX_ARL_DROP),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_TX_UNICAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_TX_MULTICAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_TX_BROADCAST),
++		    HREAD4(sc, AIRSW_MIB(port) + AIRSW_MIB_TX_DROP));
++	}
++}
++
++/* Find the controller of the PHY's actual DT bus, not the first switch. */
++struct air_mdio *
++airsw_mdio_by_node(int node)
++{
++	struct airsw_softc *sc;
++	int i;
++
++	if (node == 0)
++		return NULL;
++	for (i = 0; i < airsw_cd.cd_ndevs; i++) {
++		sc = airsw_cd.cd_devs[i];
++		if (sc != NULL && sc->sc_mdio_node == node)
++			return &sc->sc_mdio;
++	}
++	return NULL;
++}
+diff --git a/dev/fdt/com_fdt.c b/dev/fdt/com_fdt.c
+index 6c49ddc..8b5bda2 100644
+--- a/dev/fdt/com_fdt.c
++++ b/dev/fdt/com_fdt.c
+@@ -58,6 +58,7 @@ com_fdt_init_cons(void)
+ 	    (node = fdt_find_cons("intel,xscale-uart")) == NULL &&
+ 	    (node = fdt_find_cons("marvell,armada-38x-uart")) == NULL &&
+ 	    (node = fdt_find_cons("mediatek,mt6577-uart")) == NULL &&
++	    (node = fdt_find_cons("ns16550")) == NULL &&
+ 	    (node = fdt_find_cons("ns16550a")) == NULL &&
+ 	    (node = fdt_find_cons("snps,dw-apb-uart")) == NULL &&
+ 	    (node = fdt_find_cons("ti,omap3-uart")) == NULL &&
+@@ -74,7 +75,8 @@ com_fdt_init_cons(void)
+ 	 * comcnattach() does by doing the minimal setup here.
+ 	 */
+ 
+-	if (OF_is_compatible(stdout_node, "ns16550a")) {
++	if (OF_is_compatible(stdout_node, "ns16550") ||
++	    OF_is_compatible(stdout_node, "ns16550a")) {
+ 		width = 1;
+ 		shift = 0;
+ 	} else {
+@@ -101,6 +103,7 @@ com_fdt_match(struct device *parent, void *match, void *aux)
+ 	    OF_is_compatible(faa->fa_node, "intel,xscale-uart") ||
+ 	    OF_is_compatible(faa->fa_node, "marvell,armada-38x-uart") ||
+ 	    OF_is_compatible(faa->fa_node, "mediatek,mt6577-uart") ||
++	    OF_is_compatible(faa->fa_node, "ns16550") ||
+ 	    OF_is_compatible(faa->fa_node, "ns16550a") ||
+ 	    OF_is_compatible(faa->fa_node, "snps,dw-apb-uart") ||
+ 	    OF_is_compatible(faa->fa_node, "ti,omap3-uart") ||
+@@ -135,7 +138,8 @@ com_fdt_attach(struct device *parent, struct device *self, void *aux)
+ 	sc->sc_uarttype = COM_UART_16550;
+ 	sc->sc_frequency = freq ? freq : COM_FREQ;
+ 
+-	if (OF_is_compatible(faa->fa_node, "ns16550a")) {
++	if (OF_is_compatible(faa->fa_node, "ns16550") ||
++	    OF_is_compatible(faa->fa_node, "ns16550a")) {
+ 		width = 1;
+ 		shift = 0;
+ 	} else {
+diff --git a/dev/fdt/en8811.c b/dev/fdt/en8811.c
+new file mode 100644
+index 0000000..a9d98b6
+--- /dev/null
++++ b/dev/fdt/en8811.c
+@@ -0,0 +1,414 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/* EN8811H firmware and PHY management over a Clause 22 MDIO transport. */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++
++#include <dev/mii/mii.h>
++#include <dev/fdt/airmdio.h>
++#include <dev/fdt/en8811var.h>
++
++#define EN8811_ID		0x03a2a410U
++#define EN8811_PAGE		0x1f
++#define EN8811_AUX		0x1d
++#define EN8811_PBUS_MODE		0x10
++#define EN8811_PBUS_WAH		0x11
++#define EN8811_PBUS_WAL		0x12
++#define EN8811_PBUS_WDH		0x13
++#define EN8811_PBUS_WDL		0x14
++#define EN8811_PBUS_RAH		0x15
++#define EN8811_PBUS_RAL		0x16
++#define EN8811_PBUS_RDH		0x17
++#define EN8811_PBUS_RDL		0x18
++#define EN8811_PBUS_INCR		0x8000
++#define EN8811_PBUS_PAGE		4
++#define EN8811_FW_VERSION		0x003b3c
++#define EN8811_POLARITY		0x0ca0f8
++#define EN8811_GPIO_OUTPUT	0x0cf8b8
++#define EN8811_FW_CTRL		0x0f0018
++#define EN8811_FW_LOADING		0x800000
++#define EN8811_FW_LOAD_EN		(1U << 11)
++#define EN8811_FW_DM_ADDR		0
++#define EN8811_FW_DSP_ADDR		0x100000
++#define EN8811_FW_DM_MAX		0x4000
++#define EN8811_FW_DSP_MAX		0x20000
++#define EN8811_FW_CHUNK		64
++#define EN8811_MMD_VEND1		30
++#define EN8811_MMD_VEND2		31
++#define EN8811_MMD_AN		7
++#define EN8811_FW_STATUS		0x8009
++#define EN8811_FW_READY		2
++#define EN8811_CMD(n)		(0x800c + (n))
++#define EN8811_LED_CTRL		0x21
++#define EN8811_LED_ON(n)		(0x24 + 2 * (n))
++#define EN8811_LED_BLINK(n)	(0x25 + 2 * (n))
++#define EN8811_AN_2500_CTRL	0x20
++#define EN8811_AN_ADV_2500	0x80
++
++#define PHY_READ(ep, reg)		\
++	((ep)->ep_mdio->am_read((ep)->ep_mdio->am_cookie, (ep)->ep_addr, (reg)))
++#define PHY_WRITE(ep, reg, val)	\
++	((ep)->ep_mdio->am_write((ep)->ep_mdio->am_cookie, (ep)->ep_addr, \
++	    (reg), (val)))
++
++int	en8811_page_enter(struct en8811_phy *, int, int *);
++int	en8811_page_leave(struct en8811_phy *, int, int);
++int	en8811_mmd_read(struct en8811_phy *, int, int);
++int	en8811_mmd_write(struct en8811_phy *, int, int, int);
++int	en8811_pbus(struct en8811_phy *, uint32_t, uint32_t *, uint32_t, int);
++int	en8811_write_firmware(struct en8811_phy *, uint32_t,
++	    const uint8_t *, size_t);
++int	en8811_wait_ready(struct en8811_phy *);
++int	en8811_config(struct en8811_phy *);
++
++/* Successful entry leaves the transport locked, until page_leave(). */
++int
++en8811_page_enter(struct en8811_phy *ep, int page, int *saved)
++{
++	mtx_enter(&ep->ep_mdio->am_lock);
++	*saved = PHY_READ(ep, EN8811_PAGE);
++	if (*saved < 0) {
++		mtx_leave(&ep->ep_mdio->am_lock);
++		return EIO;
++	}
++	if (PHY_WRITE(ep, EN8811_PAGE, page)) {
++		PHY_WRITE(ep, EN8811_PAGE, *saved);
++		mtx_leave(&ep->ep_mdio->am_lock);
++		return EIO;
++	}
++	return 0;
++}
++
++int
++en8811_page_leave(struct en8811_phy *ep, int saved, int error)
++{
++	int restore;
++
++	restore = PHY_WRITE(ep, EN8811_PAGE, saved);
++	/* A timed-out transaction may recover; still report the first error. */
++	if (restore)
++		PHY_WRITE(ep, EN8811_PAGE, saved);
++	mtx_leave(&ep->ep_mdio->am_lock);
++	return error ? error : restore;
++}
++
++/* Clause 45 via registers 13/14: the entire address/data cycle is atomic. */
++int
++en8811_mmd_read(struct en8811_phy *ep, int dev, int reg)
++{
++	int saved, error, val = -1;
++
++	if ((error = en8811_page_enter(ep, 0, &saved)) != 0)
++		return -1;
++	if (PHY_WRITE(ep, MII_MMDACR, dev) ||
++	    PHY_WRITE(ep, MII_MMDAADR, reg) ||
++	    PHY_WRITE(ep, MII_MMDACR, dev | MMDACR_FN_DATANPI))
++		error = EIO;
++	else if ((val = PHY_READ(ep, MII_MMDAADR)) < 0)
++		error = EIO;
++	if (en8811_page_leave(ep, saved, error))
++		return -1;
++	return val;
++}
++
++int
++en8811_mmd_write(struct en8811_phy *ep, int dev, int reg, int val)
++{
++	int saved, error;
++
++	if ((error = en8811_page_enter(ep, 0, &saved)) != 0)
++		return error;
++	if (PHY_WRITE(ep, MII_MMDACR, dev) ||
++	    PHY_WRITE(ep, MII_MMDAADR, reg) ||
++	    PHY_WRITE(ep, MII_MMDACR, dev | MMDACR_FN_DATANPI) ||
++	    PHY_WRITE(ep, MII_MMDAADR, val))
++		error = EIO;
++	return en8811_page_leave(ep, saved, error);
++}
++
++/* op: 0 = read, 1 = write, 2 = replace the bits selected by mask. */
++int
++en8811_pbus(struct en8811_phy *ep, uint32_t addr, uint32_t *data,
++    uint32_t mask, int op)
++{
++	uint32_t val = *data;
++	int saved, error, hi, lo;
++
++	if ((error = en8811_page_enter(ep, EN8811_PBUS_PAGE, &saved)) != 0)
++		return error;
++	if (PHY_WRITE(ep, EN8811_PBUS_MODE, 0)) {
++		error = EIO;
++		goto out;
++	}
++	if (op != 1) {
++		if (PHY_WRITE(ep, EN8811_PBUS_RAH, addr >> 16) ||
++		    PHY_WRITE(ep, EN8811_PBUS_RAL, addr & 0xffff)) {
++			error = EIO;
++			goto out;
++		}
++		hi = PHY_READ(ep, EN8811_PBUS_RDH);
++		lo = PHY_READ(ep, EN8811_PBUS_RDL);
++		if (hi < 0 || lo < 0) {
++			error = EIO;
++			goto out;
++		}
++		val = ((uint32_t)hi << 16) | lo;
++		if (op == 0) {
++			*data = val;
++			goto out;
++		}
++		val = (val & ~mask) | (*data & mask);
++	}
++	if (PHY_WRITE(ep, EN8811_PBUS_WAH, addr >> 16) ||
++	    PHY_WRITE(ep, EN8811_PBUS_WAL, addr & 0xffff) ||
++	    PHY_WRITE(ep, EN8811_PBUS_WDH, val >> 16) ||
++	    PHY_WRITE(ep, EN8811_PBUS_WDL, val & 0xffff))
++		error = EIO;
++out:
++	return en8811_page_leave(ep, saved, error);
++}
++
++/*
++ * Bound each transaction so link polling can use the bus between chunks.
++ * Firmware words are little endian, but MDIO sends the high half first.
++ */
++int
++en8811_write_firmware(struct en8811_phy *ep, uint32_t addr,
++    const uint8_t *fw, size_t len)
++{
++	size_t off, n, i;
++	int saved, error;
++	uint32_t word;
++
++	for (off = 0; off < len; off += n) {
++		n = MIN(len - off, EN8811_FW_CHUNK);
++		if ((error = en8811_page_enter(ep, EN8811_PBUS_PAGE, &saved)))
++			return error;
++		if (PHY_WRITE(ep, EN8811_PBUS_MODE, EN8811_PBUS_INCR) ||
++		    PHY_WRITE(ep, EN8811_PBUS_WAH, (addr + off) >> 16) ||
++		    PHY_WRITE(ep, EN8811_PBUS_WAL, (addr + off) & 0xffff)) {
++			error = EIO;
++			goto out;
++		}
++		for (i = off; i < off + n; i += 4) {
++			word = fw[i] | ((uint32_t)fw[i + 1] << 8) |
++			    ((uint32_t)fw[i + 2] << 16) | ((uint32_t)fw[i + 3] << 24);
++			if (PHY_WRITE(ep, EN8811_PBUS_WDH, word >> 16) ||
++			    PHY_WRITE(ep, EN8811_PBUS_WDL, word & 0xffff)) {
++				error = EIO;
++				break;
++			}
++		}
++out:
++		error = en8811_page_leave(ep, saved, error);
++		if (error)
++			return error;
++	}
++	return 0;
++}
++
++int
++en8811_wait_ready(struct en8811_phy *ep)
++{
++	int i, val;
++
++	for (i = 0; i < 375; i++) {
++		val = en8811_mmd_read(ep, EN8811_MMD_VEND1, EN8811_FW_STATUS);
++		if (val < 0)
++			return EIO;
++		if (val == EN8811_FW_READY)
++			return 0;
++		/* No MDIO lock or raised IPL across the MCU startup wait. */
++		tsleep_nsec(ep, PWAIT, "airmcu", MSEC_TO_NSEC(20));
++	}
++	return ETIMEDOUT;
++}
++
++int
++en8811_config(struct en8811_phy *ep)
++{
++	static const uint16_t mode1[] = { 0, 0, 0x1101, 2 };
++	static const uint16_t led_on[] = { 0xc107, 0xc101, 0xc102 };
++	uint32_t val;
++	unsigned int i;
++	int error;
++
++	/* Fixed 2500BASE-X host link with copper-side rate adaptation. */
++	for (i = 0; i < nitems(mode1); i++)
++		if ((error = en8811_mmd_write(ep, EN8811_MMD_VEND1,
++		    EN8811_CMD(i), mode1[i])) != 0)
++			return error;
++	val = (ep->ep_rxswap ? 2 : 0) | (ep->ep_txswap ? 0 : 1);
++	if ((error = en8811_pbus(ep, EN8811_POLARITY, &val, 3, 2)))
++		return error;
++
++	/* Native LED defaults: activity, 1/2.5Gb/s, and 100Mb/s/2.5Gb/s. */
++	if (en8811_mmd_write(ep, EN8811_MMD_VEND2, 0x23, 2048) ||
++	    en8811_mmd_write(ep, EN8811_MMD_VEND2, 0x22, 1024) ||
++	    en8811_mmd_write(ep, EN8811_MMD_VEND2, EN8811_LED_CTRL, 0x8008))
++		return EIO;
++	for (i = 0; i < nitems(led_on); i++)
++		if (en8811_mmd_write(ep, EN8811_MMD_VEND2,
++		    EN8811_LED_ON(i), led_on[i]) ||
++		    en8811_mmd_write(ep, EN8811_MMD_VEND2,
++		    EN8811_LED_BLINK(i), i == 0 ? 0x33f : 0))
++			return EIO;
++	val = (1U << 3) | (1U << 4) | (1U << 5);
++	return en8811_pbus(ep, EN8811_GPIO_OUTPUT, &val, val, 2);
++}
++
++int
++en8811_aneg(struct en8811_phy *ep)
++{
++	int saved, error, val;
++
++	if (!ep->ep_ready)
++		return ENXIO;
++	val = en8811_mmd_read(ep, EN8811_MMD_AN, EN8811_AN_2500_CTRL);
++	if (val < 0 || en8811_mmd_write(ep, EN8811_MMD_AN,
++	    EN8811_AN_2500_CTRL, val | EN8811_AN_ADV_2500))
++		return EIO;
++	if ((error = en8811_page_enter(ep, 0, &saved)) != 0)
++		return error;
++	/* Only full duplex 100/1000/2500 is supported by this PHY. */
++	if (PHY_WRITE(ep, MII_ANAR,
++	    ANAR_CSMA | ANAR_TX_FD | ANAR_PAUSE_TOWARDS)) {
++		error = EIO;
++		goto out;
++	}
++	val = PHY_READ(ep, MII_100T2CR);
++	if (val < 0 || PHY_WRITE(ep, MII_100T2CR,
++	    (val & ~GTCR_ADV_1000THDX) | GTCR_ADV_1000TFDX)) {
++		error = EIO;
++		goto out;
++	}
++	val = PHY_READ(ep, MII_BMCR);
++	if (val < 0 || PHY_WRITE(ep, MII_BMCR,
++	    (val & ~(BMCR_PDOWN | BMCR_ISO | BMCR_LOOP)) |
++	    BMCR_AUTOEN | BMCR_STARTNEG))
++		error = EIO;
++out:
++	return en8811_page_leave(ep, saved, error);
++}
++
++int
++en8811_init(struct en8811_phy *ep, const uint8_t *dm, size_t dmlen,
++    const uint8_t *dsp, size_t dsplen)
++{
++	uint32_t val;
++	int saved, error, id1, id2;
++
++	ep->ep_ready = 0;
++	ep->ep_version = 0;
++	/* Reject malformed images before touching the MCU or reading past EOF. */
++	if (ep->ep_mdio == NULL || ep->ep_mdio->am_read == NULL ||
++	    ep->ep_mdio->am_write == NULL || ep->ep_addr < 0 || ep->ep_addr > 31 ||
++	    dm == NULL || dsp == NULL || dmlen == 0 || dsplen == 0 ||
++	    dmlen > EN8811_FW_DM_MAX || dsplen > EN8811_FW_DSP_MAX ||
++	    (dmlen & 3) || (dsplen & 3))
++		return EINVAL;
++	if ((error = en8811_page_enter(ep, 0, &saved)) != 0)
++		return error;
++	id1 = PHY_READ(ep, MII_PHYIDR1);
++	id2 = PHY_READ(ep, MII_PHYIDR2);
++	error = (id1 < 0 || id2 < 0) ? EIO : 0;
++	if ((error = en8811_page_leave(ep, saved, error)) != 0)
++		return error;
++	if ((((uint32_t)id1 << 16) | (id2 & 0xfff0)) != EN8811_ID)
++		return ENODEV;
++
++	val = 0;
++	if ((error = en8811_pbus(ep, EN8811_FW_CTRL, &val, 0, 1)))
++		return error;
++	val = EN8811_FW_LOAD_EN;
++	if ((error = en8811_pbus(ep, EN8811_FW_LOADING, &val, val, 2)))
++		goto fail;
++	if ((error = en8811_write_firmware(ep, EN8811_FW_DM_ADDR, dm, dmlen)))
++		goto fail;
++	if ((error = en8811_write_firmware(ep, EN8811_FW_DSP_ADDR, dsp, dsplen)))
++		goto fail;
++	val = 0;
++	if ((error = en8811_pbus(ep, EN8811_FW_LOADING, &val,
++	    EN8811_FW_LOAD_EN, 2)))
++		goto fail;
++	val = 1;
++	if ((error = en8811_pbus(ep, EN8811_FW_CTRL, &val, 0, 1)))
++		goto fail;
++	if ((error = en8811_wait_ready(ep)) != 0)
++		goto fail;
++	val = 0;
++	if ((error = en8811_pbus(ep, EN8811_FW_VERSION, &val, 0, 0)))
++		goto fail;
++	ep->ep_version = val;
++	if ((error = en8811_config(ep)) != 0)
++		goto fail;
++	ep->ep_ready = 1;
++	if ((error = en8811_aneg(ep)) == 0)
++		return 0;
++fail:
++	/* A partial image must never be run as if firmware loading succeeded. */
++	ep->ep_ready = 0;
++	val = 0;
++	en8811_pbus(ep, EN8811_FW_CTRL, &val, 0, 1);
++	return error;
++}
++
++int
++en8811_status(struct en8811_phy *ep, int *speed)
++{
++	int saved, error, bmsr, aux;
++
++	*speed = 0;
++	if (!ep->ep_ready)
++		return ENXIO;
++	if ((error = en8811_page_enter(ep, 0, &saved)) != 0)
++		return error;
++	/* BMSR link status is latched low.  Both reads must succeed. */
++	bmsr = PHY_READ(ep, MII_BMSR);
++	if (bmsr < 0 || (bmsr = PHY_READ(ep, MII_BMSR)) < 0) {
++		error = EIO;
++		goto out;
++	}
++	if ((bmsr & (BMSR_LINK | BMSR_ACOMP)) != (BMSR_LINK | BMSR_ACOMP))
++		goto out;
++	aux = PHY_READ(ep, EN8811_AUX);
++	if (aux < 0) {
++		error = EIO;
++		goto out;
++	}
++	switch (aux & 0x1c) {
++	case 4:
++		*speed = 100;
++		break;
++	case 8:
++		*speed = 1000;
++		break;
++	case 12:
++		*speed = 2500;
++		break;
++	default:
++		error = EIO;
++	}
++out:
++	error = en8811_page_leave(ep, saved, error);
++	if (error)
++		*speed = 0;
++	return error;
++}
+diff --git a/dev/fdt/en8811var.h b/dev/fdt/en8811var.h
+new file mode 100644
+index 0000000..e944dc7
+--- /dev/null
++++ b/dev/fdt/en8811var.h
+@@ -0,0 +1,42 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef _DEV_FDT_EN8811VAR_H_
++#define _DEV_FDT_EN8811VAR_H_
++
++struct air_mdio;
++
++#define EN8811_FW_DM	"airoha/EthMD32.dm.bin"
++#define EN8811_FW_DSP	"airoha/EthMD32.DSP.bin"
++
++struct en8811_phy {
++	struct air_mdio	*ep_mdio;
++	int		ep_addr;
++	int		ep_rxswap;
++	int		ep_txswap;
++	int		ep_ready;
++	uint32_t	ep_version;
++};
++
++/* Initialize in process context at IPL_NONE, after both files are loaded. */
++int	en8811_init(struct en8811_phy *, const uint8_t *, size_t,
++	    const uint8_t *, size_t);
++int	en8811_aneg(struct en8811_phy *);
++/* Speed is 0 (link down), 100, 1000 or 2500; errors are reported separately. */
++int	en8811_status(struct en8811_phy *, int *);
++
++#endif
+diff --git a/dev/fdt/files.fdt b/dev/fdt/files.fdt
+index 630da9e..aec8c43 100644
+--- a/dev/fdt/files.fdt
++++ b/dev/fdt/files.fdt
+@@ -566,6 +566,27 @@ device	mvuart
+ attach	mvuart at fdt
+ file	dev/fdt/mvuart.c		mvuart
+ 
++device	airscu
++attach	airscu at fdt
++file	dev/fdt/airscu.c		airscu
++
++device	airpcs
++attach	airpcs at fdt
++file	dev/fdt/airpcs.c			airpcs	needs-flag
++
++device	airgpio
++attach	airgpio at fdt
++file	dev/fdt/airgpio.c			airgpio	needs-flag
++
++device	airsw
++attach	airsw at fdt
++file	dev/fdt/airsw.c			airsw	needs-flag
++
++device	aireth: ether, ifnet, ifmedia
++attach	aireth at fdt
++file	dev/fdt/if_aireth.c		aireth
++file	dev/fdt/en8811.c			aireth
++
+ device	dwxe: ether, ifnet, mii, ifmedia
+ attach	dwxe at fdt
+ file	dev/fdt/if_dwxe.c		dwxe
+diff --git a/dev/fdt/if_aireth.c b/dev/fdt/if_aireth.c
+new file mode 100644
+index 0000000..f3a853f
+--- /dev/null
++++ b/dev/fdt/if_aireth.c
+@@ -0,0 +1,2124 @@
++/*	$OpenBSD$	*/
++/*
++ * Copyright (c) 2026 Mikhael Skvortsov <mikhael.skvortsov@gmail.com>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * Driver for the Airoha EN7581 frame engine.  GDM1 connects to airsw(4),
++ * GDM4 to the WAN PHY.  Each QDMA supplies one Tx ring; QDMA0 supplies
++ * the shared Rx ring.  The packet processing engine and NPU are not used.
++ * The external PHY and its fixed 2500BASE-X PCS are initialized natively.
++ */
++
++#include "airsw.h"
++#include "airpcs.h"
++#include "airgpio.h"
++#include "bpfilter.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/device.h>
++#include <sys/kernel.h>
++#include <sys/malloc.h>
++#include <sys/mbuf.h>
++#include <sys/queue.h>
++#include <sys/socket.h>
++#include <sys/sockio.h>
++#include <sys/timeout.h>
++
++#include <machine/bus.h>
++#include <machine/fdt.h>
++
++#include <net/if.h>
++#include <net/if_media.h>
++
++#include <dev/mii/mii.h>
++
++#include <dev/ofw/openfirm.h>
++#include <dev/ofw/ofw_clock.h>
++#include <dev/ofw/ofw_misc.h>
++#include <dev/ofw/fdt.h>
++#include <dev/fdt/airmdio.h>
++#include <dev/fdt/airpcsvar.h>
++#include <dev/fdt/airgpiovar.h>
++#include <dev/fdt/en8811var.h>
++
++#if NBPFILTER > 0
++#include <net/bpf.h>
++#endif
++
++#include <netinet/in.h>
++#include <netinet/if_ether.h>
++
++/* SCU registers */
++#define SCU_SHARE_FEMEM_SEL		0x0958
++
++/* FE registers */
++#define FE_DMA_GLO_CFG			0x0000
++#define  FE_DMA_GLO_L2_SPACE_MASK	(0xfU << 4)
++#define  FE_DMA_GLO_L2_SPACE(x)		((x) << 4)
++#define  FE_DMA_GLO_PAGE_128		(1U << 3)
++#define FE_RST_GLO_CFG			0x0004
++#define  FE_RST_CORE			(1U << 0)
++#define  FE_RST_GDM3_MBI_ARB		(1U << 2)
++#define  FE_RST_GDM4_MBI_ARB		(1U << 3)
++#define FE_WAN_PORT			0x0024
++#define FE_CDM1_OQ_MAP(n)			(0x0050 + (n) * 4)
++#define FE_PCE_CFG			0x0070
++#define FE_PSE_QUEUE_CFG		0x0080
++#define  FE_PSE_QUEUE_PORT(x)		((x) << 24)
++#define  FE_PSE_QUEUE_ID(x)		((x) << 16)
++#define  FE_PSE_QUEUE_WRITE		(1U << 8)
++#define  FE_PSE_QUEUE_OQRSV		(1U << 0)
++#define FE_PSE_QUEUE_VAL		0x0084
++#define FE_PSE_FQ_CFG			0x008c
++#define  FE_PSE_FQ_LIMIT_MASK		0x7fff
++#define FE_PSE_BUF_SET			0x0090
++#define FE_PSE_SHARE_THD		0x0094
++#define FE_PSE_IQ_REV1			0x0108
++#define FE_PSE_IQ_REV2			0x010c
++#define FE_VIP_PORT_EN			0x01f0
++#define FE_IFC_PORT_EN			0x01f4
++#define FE_IFC_CFG			0x0200
++#define FE_VIP_EN(n)			(0x0300 + (n) * 8)
++#define FE_CDM_BASE(n)			((n) == 1 ? 0x0400 : 0x1400)
++#define FE_CDM_VLAN_CTRL(n)		FE_CDM_BASE(n)
++#define FE_CDM_FWD_CFG(n)			(FE_CDM_BASE(n) + 0x08)
++#define FE_CDM_CRSN_QSEL(n, m)		(FE_CDM_BASE(n) + 0x10 + (m) * 4)
++#define FE_CDM_LRO_EN(n)			(FE_CDM_BASE(n) + 0x80)
++#define FE_PPE_GLO_CFG(n)			((n) == 0 ? 0x0e00 : 0x1e00)
++#define FE_MC_VLAN_EN			0x2100
++#define FE_SP_DFT_CPORT(n)		(0x20e0 + (n) * 4)
++#define FE_GDM_BASE(x)			((x) == 4 ? 0x2500 : (x) == 3 ? 0x1100 : \
++					    (x) == 2 ? 0x1500 : 0x0500)
++#define FE_GDM_FWD_CFG(x)		FE_GDM_BASE(x)
++#define  FE_GDM_FWD_CFG_STRIP_CRC	(1U << 16)
++#define  FE_GDM_FWD_CFG_DROP_CRC_ERR	(1U << 23)
++#define  FE_GDM_FWD_CFG_QSEL_MASK	0xffff	/* uc/bc/mc/other dest ports */
++#define  FE_GDM_FWD_CFG_DROP		0xffff	/* all of them to PSE port 15 */
++#define FE_GDM_INGRESS_CFG(x)		(FE_GDM_FWD_CFG(x) + 0x10)
++#define  FE_GDM_INGRESS_STAG_EN		(1U << 0)
++#define  FE_GDM_INGRESS_FC_EN		(1U << 1)
++#define FE_GDM_LEN_CFG(x)		(FE_GDM_FWD_CFG(x) + 0x14)
++#define  FE_GDM_LEN_SHORT_MASK		(0x3fffU << 0)
++#define  FE_GDM_LEN_SHORT(x)		((x) << 0)
++#define  FE_GDM_LEN_LONG_MASK		(0x3fffU << 16)
++#define  FE_GDM_LEN_LONG(x)		((x) << 16)
++#define FE_GDM_LPBK_CFG(x)		(FE_GDM_BASE(x) + 0x1c)
++#define FE_GDM_SRC_PORT_SET(x)		(FE_GDM_BASE(x) + 0x23c)
++#define  FE_GDM_SPORT_OFFSET_MASK	(0xfffU << 8)
++#define  FE_GDM_SPORT_OFFSET_8		(0x888U << 8)
++#define FE_CPORT_CFG			0x0540
++#define  FE_CPORT_PAD			(1U << 26)
++#define  FE_CPORT_PORT_XFC		(1U << 25)
++#define FE_CDM_NCRSN_QSEL		8	/* 32 reasons, 4 per register */
++/* MIB counters, relative to FE_GDM_BASE() */
++#define FE_GDM_TX_OK_PKT_CNT		0x0104
++#define FE_GDM_TX_ETH_PKT_CNT		0x0110
++#define FE_GDM_TX_ETH_DROP_CNT		0x0118
++#define FE_GDM_RX_OK_PKT_CNT		0x0148
++#define FE_GDM_RX_FC_DROP_CNT		0x014c
++#define FE_GDM_RX_RC_DROP_CNT		0x0150
++#define FE_GDM_RX_OVERFLOW_DROP_CNT	0x0154
++#define FE_GDM_RX_ERROR_DROP_CNT	0x0158
++#define FE_GDM_RX_ETH_PKT_CNT		0x0160
++#define FE_GDM_RX_ETH_DROP_CNT		0x0168
++#define FE_GDM_RX_ETH_BC_CNT		0x016c
++#define  FE_GDM_FWD_CFG_PAD_EN		(1U << 28)
++
++/* QDMA registers */
++#define QDMA_GLOBAL_CFG			0x0004
++#define  QDMA_GLOBAL_CFG_DMA_PREF(x)	((x) << 29)
++#define  QDMA_GLOBAL_CFG_CPU_TXR_RR	(1U << 28)
++#define  QDMA_GLOBAL_CFG_PAYLOAD_SWAP	(1U << 26)
++#define  QDMA_GLOBAL_CFG_IRQ0_EN	(1U << 19)
++#define  QDMA_GLOBAL_CFG_TX_WB_DONE	(1U << 6)
++#define  QDMA_GLOBAL_CFG_MAX_ISSUE(x)	((x) << 4)
++#define  QDMA_GLOBAL_CFG_RX_DMA_BUSY	(1U << 3)
++#define  QDMA_GLOBAL_CFG_RX_DMA_EN	(1U << 2)
++#define  QDMA_GLOBAL_CFG_TX_DMA_BUSY	(1U << 1)
++#define  QDMA_GLOBAL_CFG_TX_DMA_EN	(1U << 0)
++#define QDMA_FWD_DSCP_BASE		0x0010
++#define QDMA_FWD_BUF_BASE		0x0014
++#define QDMA_HW_FWD_DSCP_CFG		0x0018
++#define  QDMA_HW_FWD_DSCP_PAYLOAD_MASK	(0x3U << 28)
++#define  QDMA_HW_FWD_DSCP_MIN_SCAT_MASK	0xffff
++#define QDMA_INT_STATUS0		0x0020
++#define QDMA_INT_STATUS1		0x0024
++#define QDMA_INT_ENABLE0		0x0028
++#define QDMA_INT_ENABLE1		0x002c
++#define QDMA_INT_STATUS(n)		((n) == 4 ? 0x0730 : \
++					(n) >= 2 ? 0x0720 + ((n) - 2) * 4 : \
++					0x0020 + (n) * 4)
++#define QDMA_INT_ENABLE(b, n)		((n) == 4 ? 0x0750 + (b) * 32 : \
++					(n) >= 2 ? 0x0740 + (b) * 32 + \
++					((n) - 2) * 4 : 0x0028 + (b) * 8 + (n) * 4)
++#define  QDMA_INT0_IRQ0_FULL		(1U << 1)
++#define  QDMA_INT0_IRQ0			(1U << 0)
++#define  QDMA_INT1_RX0_DONE		(1U << 0)
++#define QDMA_TX_IRQ_BASE		0x0050
++#define QDMA_TX_IRQ1_BASE		0x0048
++#define QDMA_TX_IRQ1_CFG			0x004c
++#define QDMA_TX_IRQ_CFG			0x0054
++#define  QDMA_TX_IRQ_THR(x)		((x) << 16)
++#define  QDMA_TX_IRQ_DEPTH(x)		((x) << 0)
++#define QDMA_IRQ_CLEAR_LEN		0x0058
++#define QDMA_IRQ_STATUS			0x005c
++#define QDMA_IRQ1_CLEAR_LEN		0x0064
++#define QDMA_IRQ1_STATUS			0x0068
++#define  QDMA_IRQ_STATUS_ENTRY_LEN(x)	(((x) >> 16) & 0xfff)
++#define  QDMA_IRQ_STATUS_HEAD(x)	((x) & 0xfff)
++#define QDMA_TX_RING_BASE		0x0100
++#define QDMA_TX_RING_BLOCKING		0x0104
++#define QDMA_TX_CPU_IDX			0x0108
++#define QDMA_TX_DMA_IDX			0x010c
++#define QDMA_TXN(n, reg)			((n) < 8 ? (reg) + ((n) << 5) : \
++					(reg) + 0x0a00 + (((n) - 8) << 5))
++#define QDMA_NTXRINGS			32
++#define QDMA_QUEUE_CLOSE(n)		(0x00a0 + (n) * 4)
++#define QDMA_RX_RING_BASE		0x0200
++#define QDMA_RX_RING_SIZE		0x0204
++#define  QDMA_RX_RING_THR(x)		((x) << 16)
++#define QDMA_RX_CPU_IDX			0x0208
++#define QDMA_RX_DMA_IDX			0x020c
++#define QDMA_RX_DELAY_INT		0x0210
++#define QDMA_RX_SCATTER_CFG		0x0214
++/* Per ring n of 32; the QDMA_RX_* above are ring 0. */
++#define QDMA_RXN(n, reg)		((n) < 16 ? (reg) + ((n) << 5) : \
++					    (reg) + 0x0c00 + (((n) - 16) << 5))
++#define QDMA_NRXRINGS			32
++#define  QDMA_RX_IDX_MASK		0xffff
++#define QDMA_LMGR_INIT_CFG		0x1000
++#define  QDMA_LMGR_INIT_START		(1U << 31)
++#define  QDMA_LMGR_SRAM_MODE		(1U << 30)
++#define  QDMA_LMGR_DESC_NUM_MASK	0x1ffff
++#define QDMA_FWD_DSCP_LOW_THR		0x1004
++#define QDMA_INGRESS_TRTCM_CFG		0x0070
++#define QDMA_EGRESS_RATE_METER_CFG	0x100c
++#define QDMA_EGRESS_TRTCM_CFG		0x1010
++#define QDMA_CHAN_QOS_MODE(n)		(0x1040 + (n) * 4)
++#define  QDMA_CHAN_QOS_MODE_SP		0x11111111U
++#define QDMA_NQOSREGS			4	/* eight channels per register */
++#define QDMA_GLB_TRTCM_CFG		0x1080
++#define QDMA_TXQ_CNGST_CFG		0x10a0
++#define QDMA_SLA_TRTCM_CFG		0x1150
++
++/* QDMA descriptor */
++struct aireth_desc {
++	uint32_t	rsv;
++	uint32_t	ctrl;
++#define AIRETH_CTRL_DONE		(1U << 31)
++#define AIRETH_CTRL_DROP		(1U << 30)
++#define AIRETH_CTRL_MORE		(1U << 29)
++#define AIRETH_CTRL_LEN_MASK		0xffff
++	uint32_t	addr;
++	uint32_t	data;
++#define AIRETH_DATA_NEXT_ID_MASK	0xffff
++	uint32_t	msg0;
++	uint32_t	msg1;
++#define AIRETH_TXMSG1_METER(x)		((x) << 24)
++#define AIRETH_TXMSG1_FPORT(x)		((x) << 20)
++#define AIRETH_RXMSG1_SPORT(x)		(((x) >> 21) & 0x1f)
++#define  AIRETH_SPORT_GDM1_MIN		0x10	/* .. 0x14 */
++#define  AIRETH_SPORT_GDM1_MAX		0x14
++#define  AIRETH_SPORT_GDM4		0x18	/* HSGMII ETH serdes */
++	uint32_t	msg2;
++	uint32_t	msg3;
++};
++
++/* QDMA hardware forwarding descriptor */
++struct aireth_fwd_desc {
++	uint32_t	data[8];
++};
++
++#define AIRETH_FE_PORT_GDM1	1
++#define AIRETH_FE_PORT_GDM4	9
++
++#define AIRETH_NPORTS		2	/* GDM1 (switch), GDM4 (lan1/WAN) */
++
++#define AIRETH_NTXDESC		256
++#define AIRETH_NTXSEGS		16
++#define AIRETH_NRXDESC		256
++#define AIRETH_NIRQ		256
++#define AIRETH_NFWDDESC		256
++#define AIRETH_FWDBUFSZ		2048
++
++struct aireth_buf {
++	bus_dmamap_t	tb_map;
++	struct mbuf	*tb_m;
++};
++
++struct aireth_dmamem {
++	bus_dmamap_t		tdm_map;
++	bus_dma_segment_t	tdm_seg;
++	size_t			tdm_size;
++	caddr_t			tdm_kva;
++};
++#define AIRETH_DMA_MAP(_tdm)	((_tdm)->tdm_map)
++#define AIRETH_DMA_LEN(_tdm)	((_tdm)->tdm_size)
++#define AIRETH_DMA_DVA(_tdm)	((_tdm)->tdm_map->dm_segs[0].ds_addr)
++#define AIRETH_DMA_KVA(_tdm)	((void *)(_tdm)->tdm_kva)
++
++struct aireth_softc;
++
++/*
++ * A QDMA Tx queue.  QDMA0 serves the LAN (GDM1) and all of Rx; the
++ * frame engine only delivers frames to GDM4 (lan1/WAN) from QDMA1, as
++ * Linux uses it, so that one is set up for Tx only.
++ */
++struct aireth_txq {
++	struct aireth_softc	*q_sc;
++	int			 q_id;		/* QDMA index */
++	bus_space_handle_t	 q_ioh;
++	struct aireth_dmamem	*q_ring;
++	struct aireth_buf	*q_buf;
++	struct aireth_desc	*q_desc;
++	int			 q_prod;
++	int			 q_cons;
++	struct aireth_dmamem	*q_irqring;	/* Tx completion queue */
++	uint32_t		*q_irq;
++	struct aireth_dmamem	*q_fwddesc;	/* hw forwarding link mgr */
++	struct aireth_dmamem	*q_fwdbuf;
++	struct mutex		 q_mtx;
++	void			*q_ih;
++};
++
++struct aireth_port {
++	struct aireth_softc	*ap_sc;
++	int			 ap_gdm;	/* GDM index, 1 or 4 */
++	int			 ap_fport;	/* PSE port for Tx */
++	struct aireth_txq	*ap_txq;
++	int			 ap_phy;	/* MDIO address, -1 internal */
++	int			 ap_phynode;
++	int			 ap_node;
++	int			 ap_pcsnode;
++	struct airpcs_softc	*ap_pcs;
++	struct en8811_phy	 ap_phydev;
++	struct arpcom		 ap_ac;
++	struct ifmedia		 ap_media;
++	uint64_t		 ap_active;	/* current media */
++	struct timeout		 ap_tick;	/* link poll */
++};
++
++struct aireth_softc {
++	struct device		sc_dev;
++	int			sc_node;
++	bus_space_tag_t		sc_iot;
++	bus_space_handle_t	sc_fe_ioh;
++	bus_size_t		sc_fe_iosize;
++	bus_space_handle_t	sc_qdma_ioh;
++	bus_dma_tag_t		sc_dmat;
++	void			*sc_ih;
++
++	struct aireth_port	sc_ports[AIRETH_NPORTS];
++	int			sc_nports;
++	int			sc_nup;		/* ports up; rings run if > 0 */
++	int			sc_dma_failed;	/* stopped DMA could still own buffers */
++	struct aireth_txq	sc_txq[2];
++	int			sc_ntxq;
++
++	struct aireth_dmamem	*sc_rxring;
++	struct aireth_buf	*sc_rxbuf;
++	struct aireth_desc	*sc_rxdesc;
++	int			sc_rx_prod;
++	struct if_rxring	sc_rx_ring;
++	int			sc_rx_cons;
++	struct mbuf		*sc_rx_head;	/* frame being reassembled */
++	struct mbuf		*sc_rx_tail;
++	int			sc_rx_port;	/* ... and its port */
++
++	struct timeout		sc_rxto;
++	struct mutex		sc_rx_mtx;	/* Rx ring: intr vs. poll */
++	u_int			sc_rxpoll_hits;	/* frames the poll found */
++	u_int			sc_rxerr_len;	/* Rx errors by cause */
++	u_int			sc_rxerr_big;
++	u_int			sc_rxfrags;	/* frames in several buffers */
++	u_int			sc_rxsport[32];	/* frames by source port */
++	uint16_t		sc_rxfraglen[8];	/* last fragment lengths */
++	int			sc_rxfragidx;
++};
++
++#define DEVNAME(_s)	((_s)->sc_dev.dv_xname)
++
++int	aireth_match(struct device *, void *, void *);
++void	aireth_attach(struct device *, struct device *, void *);
++void	aireth_attachhook(struct device *);
++void	aireth_deferred(struct device *);
++int	aireth_enaddr(int, uint8_t *);
++
++const struct cfattach aireth_ca = {
++	sizeof(struct aireth_softc), aireth_match, aireth_attach
++};
++
++struct cfdriver aireth_cd = {
++	NULL, "aireth", DV_IFNET
++};
++
++#define FE_READ(sc, reg)						\
++	bus_space_read_4((sc)->sc_iot, (sc)->sc_fe_ioh, (reg))
++#define FE_WRITE(sc, reg, val)						\
++	bus_space_write_4((sc)->sc_iot, (sc)->sc_fe_ioh, (reg), (val))
++#define QDMA_READ(sc, reg)						\
++	bus_space_read_4((sc)->sc_iot, (sc)->sc_qdma_ioh, (reg))
++#define QDMA_WRITE(sc, reg, val)					\
++	bus_space_write_4((sc)->sc_iot, (sc)->sc_qdma_ioh, (reg), (val))
++#define TXQ_READ(q, reg)						\
++	bus_space_read_4((q)->q_sc->sc_iot, (q)->q_ioh, (reg))
++#define TXQ_WRITE(q, reg, val)						\
++	bus_space_write_4((q)->q_sc->sc_iot, (q)->q_ioh, (reg), (val))
++
++int	aireth_hw_init(struct aireth_softc *);
++int	aireth_fe_init(struct aireth_softc *);
++void	aireth_qdma_init(struct aireth_softc *, bus_space_handle_t);
++void	aireth_hw_free(struct aireth_softc *);
++
++int	aireth_ioctl(struct ifnet *, u_long, caddr_t);
++void	aireth_start(struct ifqueue *);
++void	aireth_watchdog(struct ifnet *);
++
++int	aireth_media_change(struct ifnet *);
++void	aireth_media_status(struct ifnet *, struct ifmediareq *);
++
++void	aireth_rxtick(void *);
++
++int	aireth_intr(void *);
++int	aireth_intr_txq(void *);
++void	aireth_txq_intr(struct aireth_txq *);
++int	aireth_txq_init(struct aireth_softc *, struct aireth_txq *);
++void	aireth_txq_up(struct aireth_txq *);
++void	aireth_txq_down(struct aireth_txq *);
++void	aireth_tx_proc(struct aireth_txq *);
++void	aireth_rx_proc(struct aireth_softc *);
++
++void	aireth_up(struct aireth_softc *);
++void	aireth_down(struct aireth_softc *);
++int	aireth_port_up(struct aireth_port *);
++void	aireth_port_down(struct aireth_port *);
++int	aireth_port_attach(struct aireth_softc *, struct aireth_port *, int,
++	    int);
++void	aireth_port_tick(void *);
++void	aireth_dump(struct aireth_softc *);
++void	aireth_quiesce_rx_rings(struct aireth_softc *);
++int	aireth_quiesce_rings(struct aireth_softc *, bus_space_handle_t, int);
++int	aireth_stop_qdma(struct aireth_softc *, bus_space_handle_t);
++
++int	aireth_encap(struct aireth_txq *, struct aireth_port *,
++	    struct mbuf *, int *, int *);
++
++struct aireth_dmamem *
++	aireth_dmamem_alloc(struct aireth_softc *, bus_size_t, bus_size_t);
++void	aireth_dmamem_free(struct aireth_softc *, struct aireth_dmamem *);
++struct mbuf *aireth_alloc_mbuf(struct aireth_softc *, bus_dmamap_t);
++void	aireth_fill_rx_ring(struct aireth_softc *);
++
++int
++aireth_match(struct device *parent, void *cfdata, void *aux)
++{
++	struct fdt_attach_args *faa = aux;
++
++	return OF_is_compatible(faa->fa_node, "airoha,en7581-eth");
++}
++
++void
++aireth_attach(struct device *parent, struct device *self, void *aux)
++{
++	struct aireth_softc *sc = (void *)self;
++	struct fdt_attach_args *faa = aux;
++	int fe, qdma, qdma1, node, i;
++
++	fe = OF_getindex(faa->fa_node, "fe", "reg-names");
++	qdma = OF_getindex(faa->fa_node, "qdma0", "reg-names");
++	if (fe < 0 || fe >= faa->fa_nreg ||
++	    qdma < 0 || qdma >= faa->fa_nreg) {
++		printf(": no registers\n");
++		return;
++	}
++
++	sc->sc_node = faa->fa_node;
++	sc->sc_iot = faa->fa_iot;
++	/* GDM4's source-port register lies beyond the DT's 0x2600 size. */
++	sc->sc_fe_iosize = MAX(faa->fa_reg[fe].size,
++	    FE_GDM_SRC_PORT_SET(4) + sizeof(uint32_t));
++	if (bus_space_map(sc->sc_iot, faa->fa_reg[fe].addr,
++	    sc->sc_fe_iosize, 0, &sc->sc_fe_ioh)) {
++		printf(": can't map FE registers\n");
++		return;
++	}
++	if (bus_space_map(sc->sc_iot, faa->fa_reg[qdma].addr,
++	    faa->fa_reg[qdma].size, 0, &sc->sc_qdma_ioh)) {
++		printf(": can't map QDMA registers\n");
++		goto unmap_fe;
++	}
++	sc->sc_dmat = faa->fa_dmat;
++
++	sc->sc_txq[0].q_sc = sc;
++	sc->sc_txq[0].q_id = 0;
++	sc->sc_txq[0].q_ioh = sc->sc_qdma_ioh;
++	sc->sc_ntxq = 1;
++
++	/*
++	 * Before anything else: Linux may have left both QDMAs running,
++	 * not even a kexec stops them.
++	 */
++	qdma1 = OF_getindex(faa->fa_node, "qdma1", "reg-names");
++	if (qdma1 >= 0 && qdma1 < faa->fa_nreg &&
++	    bus_space_map(sc->sc_iot, faa->fa_reg[qdma1].addr,
++	    faa->fa_reg[qdma1].size, 0, &sc->sc_txq[1].q_ioh) == 0) {
++		sc->sc_txq[1].q_sc = sc;
++		sc->sc_txq[1].q_id = 1;
++	} else
++		qdma1 = -1;
++	i = aireth_stop_qdma(sc, sc->sc_qdma_ioh);
++	if (qdma1 != -1 && aireth_stop_qdma(sc, sc->sc_txq[1].q_ioh))
++		i = ETIMEDOUT;
++	if (i) {
++		printf(": DMA stop timeout\n");
++		goto unmap_qdma;
++	}
++
++	/* GDM1 is connected to the switch; GDM4 is lan1 (WAN). */
++	for (node = OF_child(faa->fa_node); node; node = OF_peer(node)) {
++		if (OF_is_compatible(node, "airoha,eth-mac") &&
++		    OF_getpropint(node, "reg", 0) == 1 && OF_is_enabled(node))
++			break;
++	}
++	if (node == 0) {
++		printf(": GDM1 not enabled\n");
++		goto unmap_qdma;
++	}
++	if (aireth_port_attach(sc, &sc->sc_ports[0], node, 1))
++		goto unmap_qdma;
++	printf(": address %s", ether_sprintf(sc->sc_ports[0].ap_ac.ac_enaddr));
++
++	for (node = OF_child(faa->fa_node); node; node = OF_peer(node)) {
++		if (OF_is_compatible(node, "airoha,eth-mac") &&
++		    OF_getpropint(node, "reg", 0) == 4 && OF_is_enabled(node))
++			break;
++	}
++	if (node && qdma1 != -1 &&
++	    aireth_port_attach(sc, &sc->sc_ports[1], node, 4) == 0)
++		printf(", %s address %s", sc->sc_ports[1].ap_ac.ac_if.if_xname,
++		    ether_sprintf(sc->sc_ports[1].ap_ac.ac_enaddr));
++	printf("\n");
++
++	if (sc->sc_nports > 1)
++		sc->sc_ntxq = 2;
++	for (i = 0; i < sc->sc_ntxq; i++)
++		mtx_init(&sc->sc_txq[i].q_mtx, IPL_NET);
++	for (i = 0; i < sc->sc_nports; i++)
++		sc->sc_ports[i].ap_txq =
++		    &sc->sc_txq[sc->sc_ports[i].ap_gdm == 1 ? 0 : 1];
++	timeout_set(&sc->sc_rxto, aireth_rxtick, sc);
++	mtx_init(&sc->sc_rx_mtx, IPL_NET);
++
++	if (aireth_hw_init(sc))
++		goto unmap_qdma;
++
++	/* The first interrupt serves QDMA0 TX and RX ring 0. */
++	sc->sc_ih = fdt_intr_establish_idx(faa->fa_node, 0,
++	    IPL_NET | IPL_MPSAFE, aireth_intr, sc, DEVNAME(sc));
++	if (sc->sc_ih == NULL) {
++		printf("%s: can't establish interrupt\n", DEVNAME(sc));
++		goto free_hw;
++	}
++	sc->sc_txq[0].q_ih = sc->sc_ih;
++	/* QDMA1 bank 0 (index 4) carries its Tx completions. */
++	if (sc->sc_ntxq > 1) {
++		sc->sc_txq[1].q_ih = fdt_intr_establish_idx(faa->fa_node, 4,
++		    IPL_NET | IPL_MPSAFE, aireth_intr_txq, &sc->sc_txq[1],
++		    DEVNAME(sc));
++		if (sc->sc_txq[1].q_ih == NULL) {
++			printf("%s: can't establish QDMA1 interrupt\n",
++			    DEVNAME(sc));
++			fdt_intr_disestablish(sc->sc_ih);
++			sc->sc_ih = sc->sc_txq[0].q_ih = NULL;
++			goto free_hw;
++		}
++	}
++	config_defer(self, aireth_deferred);
++	if (sc->sc_nports > 1)
++		config_mountroot(self, aireth_attachhook);
++	return;
++
++free_hw:
++	aireth_hw_free(sc);
++unmap_qdma:
++	if (qdma1 != -1)
++		bus_space_unmap(sc->sc_iot, sc->sc_txq[1].q_ioh,
++		    faa->fa_reg[qdma1].size);
++	bus_space_unmap(sc->sc_iot, sc->sc_qdma_ioh, faa->fa_reg[qdma].size);
++unmap_fe:
++	bus_space_unmap(sc->sc_iot, sc->sc_fe_ioh, sc->sc_fe_iosize);
++}
++
++/* Attach LAN only after its sibling switch has finished native setup. */
++void
++aireth_deferred(struct device *self)
++{
++	struct aireth_softc *sc = (struct aireth_softc *)self;
++	struct aireth_port *ap;
++	struct ifnet *ifp;
++	int i, ready;
++
++	for (i = 0; i < sc->sc_nports; i++) {
++		ap = &sc->sc_ports[i];
++		if (ap->ap_phy != -1)
++			continue;
++		ifp = &ap->ap_ac.ac_if;
++		ready = 0;
++#if NAIRSW > 0
++		ready = airsw_lan_ready(ap->ap_node);
++#endif
++		if (!ready) {
++			printf("%s: native LAN switch unavailable\n", ifp->if_xname);
++			continue;
++		}
++		/* Retry NVMEM after other devices on this bus have attached. */
++		aireth_enaddr(ap->ap_node, ap->ap_ac.ac_enaddr);
++		ifp->if_baudrate = IF_Mbps(10000);
++		if_attach(ifp);
++		ether_ifattach(ifp);
++	}
++}
++
++/* Prefer a valid DT address, then an available unmodified NVMEM MAC cell. */
++int
++aireth_enaddr(int node, uint8_t *address)
++{
++	static char * const properties[] = { "local-mac-address", "mac-address" };
++	static const uint8_t zero[ETHER_ADDR_LEN];
++	uint8_t value[ETHER_ADDR_LEN];
++	uint32_t cell[2], reg[2];
++	int i, len, cellnode;
++
++	for (i = 0; i < nitems(properties); i++) {
++		if (OF_getproplen(node, properties[i]) != sizeof(value) ||
++		    OF_getprop(node, properties[i], value, sizeof(value)) != sizeof(value))
++			continue;
++		if (!(value[0] & 1) && memcmp(value, zero, sizeof(value)) != 0) {
++			memcpy(address, value, sizeof(value));
++			return 0;
++		}
++	}
++	/* The generic API accepts raw cells, not MAC address increments. */
++	len = OF_getproplen(node, "nvmem-cells");
++	if (OF_getindex(node, "mac-address", "nvmem-cell-names") != 0 ||
++	    (len != sizeof(cell[0]) && len != sizeof(cell)) ||
++	    OF_getpropintarray(node, "nvmem-cells", cell, sizeof(cell)) != len ||
++	    (len == sizeof(cell) && cell[1] != 0))
++		return ENOENT;
++	cellnode = OF_getnodebyphandle(cell[0]);
++	if (!cellnode || OF_getproplen(cellnode, "reg") != sizeof(reg) ||
++	    OF_getpropintarray(cellnode, "reg", reg, sizeof(reg)) != sizeof(reg) ||
++	    reg[1] != sizeof(value) || OF_getproplen(cellnode, "bits") >= 0)
++		return ENOENT;
++	memset(value, 0, sizeof(value));
++	if (nvmem_read_cell(node, "mac-address", value, sizeof(value)) == 0 &&
++	    !(value[0] & 1) && memcmp(value, zero, sizeof(value)) != 0) {
++		memcpy(address, value, sizeof(value));
++		return 0;
++	}
++	return ENOENT;
++}
++
++void
++aireth_attachhook(struct device *self)
++{
++	struct aireth_softc *sc = (struct aireth_softc *)self;
++	struct aireth_port *ap;
++	struct en8811_phy *ep;
++	struct ifnet *ifp;
++	uint8_t *dm, *dsp;
++	size_t dmlen, dsplen;
++	int i, error;
++
++	for (i = 0; i < sc->sc_nports; i++) {
++		ap = &sc->sc_ports[i];
++		if (ap->ap_phy == -1)
++			continue;
++		ifp = &ap->ap_ac.ac_if;
++		ep = &ap->ap_phydev;
++#if NAIRPCS > 0
++		ap->ap_pcs = airpcs_by_node(ap->ap_pcsnode);
++#endif
++		if (ap->ap_pcs == NULL) {
++			printf("%s: Ethernet PCS unavailable\n", ifp->if_xname);
++			continue;
++		}
++#if NAIRSW > 0
++		ep->ep_mdio = airsw_mdio_by_node(OF_parent(ap->ap_phynode));
++#endif
++		if (ep->ep_mdio == NULL) {
++			printf("%s: PHY MDIO bus unavailable\n", ifp->if_xname);
++			continue;
++		}
++		ep->ep_addr = ap->ap_phy;
++		ep->ep_rxswap = OF_getproplen(ap->ap_phynode,
++		    "airoha,pnswap-rx") >= 0;
++		ep->ep_txswap = OF_getproplen(ap->ap_phynode,
++		    "airoha,pnswap-tx") >= 0;
++
++		/* Load both images before halting the MCU or changing the PHY. */
++		error = loadfirmware(EN8811_FW_DM, &dm, &dmlen);
++		if (error) {
++			printf("%s: can't load %s: %d\n", ifp->if_xname,
++			    EN8811_FW_DM, error);
++			continue;
++		}
++		error = loadfirmware(EN8811_FW_DSP, &dsp, &dsplen);
++		if (error) {
++			printf("%s: can't load %s: %d\n", ifp->if_xname,
++			    EN8811_FW_DSP, error);
++			free(dm, M_DEVBUF, dmlen);
++			continue;
++		}
++#if NAIRGPIO > 0
++		error = airgpio_phy_reset(ap->ap_phynode);
++#else
++		error = ENODEV;
++#endif
++		if (error) {
++			printf("%s: PHY pinctrl/reset failed: %d\n",
++			    ifp->if_xname, error);
++			free(dm, M_DEVBUF, dmlen);
++			free(dsp, M_DEVBUF, dsplen);
++			continue;
++		}
++		error = en8811_init(ep, dm, dmlen, dsp, dsplen);
++		free(dm, M_DEVBUF, dmlen);
++		free(dsp, M_DEVBUF, dsplen);
++		if (error) {
++			printf("%s: EN8811H initialization failed: %d\n",
++			    ifp->if_xname, error);
++			continue;
++		}
++#if NAIRPCS > 0
++		error = airpcs_init(ap->ap_pcs);
++		if (error) {
++			printf("%s: PCS initialization failed: %d\n",
++			    ifp->if_xname, error);
++			continue;
++		}
++#endif
++		printf("%s: EN8811H firmware 0x%08x, native 2500BASE-X PCS\n",
++		    ifp->if_xname, ep->ep_version);
++		aireth_enaddr(ap->ap_node, ap->ap_ac.ac_enaddr);
++		if_attach(ifp);
++		ether_ifattach(ifp);
++	}
++}
++
++int
++aireth_port_attach(struct aireth_softc *sc, struct aireth_port *ap, int node,
++    int gdm)
++{
++	struct ifnet *ifp = &ap->ap_ac.ac_if;
++	uint32_t phandle;
++	char mode[32];
++	int phynode;
++
++	ap->ap_sc = sc;
++	ap->ap_node = node;
++	ap->ap_gdm = gdm;
++	ap->ap_fport = gdm == 4 ? AIRETH_FE_PORT_GDM4 : AIRETH_FE_PORT_GDM1;
++	ap->ap_phy = -1;
++	if (gdm != 1) {
++		phandle = OF_getpropint(node, "phy-handle", 0);
++		phynode = OF_getnodebyphandle(phandle);
++		if (phynode == 0 || !OF_is_enabled(phynode))
++			return ENODEV;
++		ap->ap_phy = OF_getpropint(phynode, "reg", -1);
++		if (ap->ap_phy < 0 || ap->ap_phy > 31)
++			return EINVAL;
++		memset(mode, 0, sizeof(mode));
++		OF_getprop(node, "phy-mode", mode, sizeof(mode) - 1);
++		if (strcmp(mode, "2500base-x") != 0)
++			return EINVAL;
++		ap->ap_phynode = phynode;
++		phandle = OF_getpropint(node, "pcs-handle", 0);
++		ap->ap_pcsnode = OF_getnodebyphandle(phandle);
++		if (ap->ap_pcsnode == 0 || !OF_is_enabled(ap->ap_pcsnode))
++			return ENODEV;
++	}
++
++	if (aireth_enaddr(node, ap->ap_ac.ac_enaddr))
++		ether_fakeaddr(ifp);
++
++	ifp->if_softc = ap;
++	ifp->if_flags = IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST;
++	ifp->if_xflags = IFXF_MPSAFE;
++	ifp->if_ioctl = aireth_ioctl;
++	ifp->if_qstart = aireth_start;
++	ifp->if_watchdog = aireth_watchdog;
++	ifq_init_maxlen(&ifp->if_snd, AIRETH_NTXDESC - 1);
++	/* XXX one device, two interfaces: aireth<2u> and aireth<2u+1>. */
++	snprintf(ifp->if_xname, IFNAMSIZ, "%s%d", sc->sc_dev.dv_cfdata->
++	    cf_driver->cd_name, sc->sc_dev.dv_unit * AIRETH_NPORTS +
++	    (int)(ap - sc->sc_ports));
++	ifp->if_capabilities = IFCAP_VLAN_MTU;
++
++	ifmedia_init(&ap->ap_media, 0, aireth_media_change,
++	    aireth_media_status);
++	if (ap->ap_phy == -1) {
++		/* The link to the switch is internal and always up. */
++		ap->ap_active = IFM_ETHER | IFM_MANUAL;
++		ifmedia_add(&ap->ap_media, IFM_ETHER | IFM_MANUAL, 0, NULL);
++		ifmedia_set(&ap->ap_media, IFM_ETHER | IFM_MANUAL);
++	} else {
++		/* Native PHY management, fixed 2500BASE-X host interface. */
++		ap->ap_active = IFM_ETHER | IFM_NONE;
++		ifmedia_add(&ap->ap_media, IFM_ETHER | IFM_AUTO, 0, NULL);
++		ifmedia_set(&ap->ap_media, IFM_ETHER | IFM_AUTO);
++		timeout_set(&ap->ap_tick, aireth_port_tick, ap);
++	}
++
++	sc->sc_nports++;
++	return 0;
++}
++
++/* Poll copper and host PCS link state; lan1 has no link interrupt. */
++void
++aireth_port_tick(void *arg)
++{
++	struct aireth_port *ap = arg;
++	struct ifnet *ifp = &ap->ap_ac.ac_if;
++	int speed = 0, state;
++	uint64_t active = IFM_ETHER | IFM_NONE;
++
++	ifp->if_baudrate = 0;
++	if (en8811_status(&ap->ap_phydev, &speed) != 0)
++		speed = 0;
++#if NAIRPCS > 0
++	if (airpcs_poll(ap->ap_pcs, speed != 0) != 1)
++		speed = 0;
++#endif
++	switch (speed) {
++	case 2500:
++		active = IFM_ETHER | IFM_2500_T | IFM_FDX;
++		ifp->if_baudrate = IF_Mbps(2500);
++		break;
++	case 1000:
++		active = IFM_ETHER | IFM_1000_T | IFM_FDX;
++		ifp->if_baudrate = IF_Mbps(1000);
++		break;
++	case 100:
++		active = IFM_ETHER | IFM_100_TX | IFM_FDX;
++		ifp->if_baudrate = IF_Mbps(100);
++		break;
++	default:
++		break;
++	}
++	ap->ap_active = active;
++
++	state = speed ? LINK_STATE_FULL_DUPLEX : LINK_STATE_DOWN;
++	if (ifp->if_link_state != state) {
++		ifp->if_link_state = state;
++		if_link_state_change(ifp);
++	}
++
++	if (ifp->if_flags & IFF_RUNNING)
++		timeout_add_sec(&ap->ap_tick, 1);
++}
++
++/*
++ * Set up a CPU-only datapath after resetting FE.  In particular, WAN
++ * VIP traffic must not retain Linux's route to CDM2 and QDMA1 Rx.
++ * PCS/SerDes and the external PHY have separate resets and are left alone.
++ */
++int
++aireth_fe_init(struct aireth_softc *sc)
++{
++	static const uint8_t nqueues[] = { 6, 6, 32, 6, 4, 6, 8, 10, 4, 2, 2 };
++	uint32_t val, limit, reserved = 0, pages;
++	unsigned int p;
++	int q, i;
++
++	/* Set PSE page size and reset its core and the GDM3/4 arbiters. */
++	val = FE_READ(sc, FE_DMA_GLO_CFG);
++	val &= ~FE_DMA_GLO_L2_SPACE_MASK;
++	val |= FE_DMA_GLO_L2_SPACE(2) | FE_DMA_GLO_PAGE_128;
++	FE_WRITE(sc, FE_DMA_GLO_CFG, val);
++	FE_WRITE(sc, FE_RST_GLO_CFG, FE_RST_CORE |
++	    FE_RST_GDM3_MBI_ARB | FE_RST_GDM4_MBI_ARB);
++	delay(1000);
++
++	/* Drop ingress on every GDM until the corresponding interface is up. */
++	for (p = 1; p <= 4; p++) {
++		val = FE_GDM_FWD_CFG_PAD_EN | FE_GDM_FWD_CFG_DROP_CRC_ERR |
++		    FE_GDM_FWD_CFG_DROP;
++		if (p >= 3)
++			val |= FE_GDM_FWD_CFG_STRIP_CRC;
++		FE_WRITE(sc, FE_GDM_FWD_CFG(p), val);
++		FE_WRITE(sc, FE_GDM_LEN_CFG(p),
++		    FE_GDM_LEN_SHORT(60) | FE_GDM_LEN_LONG(1536));
++		FE_WRITE(sc, FE_GDM_INGRESS_CFG(p), FE_GDM_INGRESS_FC_EN |
++		    (p >= 3 ? FE_GDM_INGRESS_STAG_EN : 0));
++		FE_WRITE(sc, FE_GDM_LPBK_CFG(p), 0);
++	}
++	val = FE_READ(sc, FE_GDM_SRC_PORT_SET(4));
++	val &= ~FE_GDM_SPORT_OFFSET_MASK;
++	FE_WRITE(sc, FE_GDM_SRC_PORT_SET(4), val | FE_GDM_SPORT_OFFSET_8);
++
++	/* No packet classification, loopback, aggregation or offload engines. */
++	FE_WRITE(sc, FE_WAN_PORT, 0);
++	FE_WRITE(sc, FE_PCE_CFG, 0);
++	FE_WRITE(sc, FE_VIP_PORT_EN, 0);
++	FE_WRITE(sc, FE_IFC_PORT_EN, 0);
++	FE_WRITE(sc, FE_IFC_CFG, 0);
++	FE_WRITE(sc, FE_MC_VLAN_EN, 0);
++	for (i = 0; i < 2; i++)
++		FE_WRITE(sc, FE_PPE_GLO_CFG(i), 0);
++	for (i = 0; i < 32; i++)
++		FE_WRITE(sc, FE_VIP_EN(i), 0);
++	for (i = 0; i < 4; i++) {
++		/* All source ports default to CDM1; all Rx rings use OQ0. */
++		FE_WRITE(sc, FE_SP_DFT_CPORT(i), 0);
++		FE_WRITE(sc, FE_CDM1_OQ_MAP(i), 0);
++	}
++	for (p = 1; p <= 2; p++) {
++		FE_WRITE(sc, FE_CDM_VLAN_CTRL(p), (uint32_t)ETHERTYPE_VLAN << 16);
++		FE_WRITE(sc, FE_CDM_FWD_CFG(p), 0);
++		FE_WRITE(sc, FE_CDM_LRO_EN(p), 0);
++		for (i = 0; i < FE_CDM_NCRSN_QSEL; i++)
++			FE_WRITE(sc, FE_CDM_CRSN_QSEL(p, i), 0);
++	}
++	FE_WRITE(sc, FE_CPORT_CFG, FE_CPORT_PAD | FE_CPORT_PORT_XFC);
++
++	/* Input queue reservations, in 128-byte PSE pages. */
++	val = FE_READ(sc, FE_PSE_IQ_REV1);
++	FE_WRITE(sc, FE_PSE_IQ_REV1, (val & ~(0xffU << 16)) | (0x10U << 16));
++	val = FE_READ(sc, FE_PSE_IQ_REV2);
++	FE_WRITE(sc, FE_PSE_IQ_REV2, (val & ~0xffffU) | 0x4034);
++
++	/* Reserve space only for the CPU, switch and WAN output queues. */
++	for (p = 0; p < nitems(nqueues); p++) {
++		pages = (p == 0 || p == 1 || p == 5 || p == 9) ? 64 : 0;
++		for (q = 0; q < nqueues[p]; q++) {
++			FE_WRITE(sc, FE_PSE_QUEUE_VAL, pages);
++			FE_WRITE(sc, FE_PSE_QUEUE_CFG, FE_PSE_QUEUE_PORT(p) |
++			    FE_PSE_QUEUE_ID(q) | FE_PSE_QUEUE_WRITE |
++			    FE_PSE_QUEUE_OQRSV);
++			reserved += pages;
++		}
++	}
++	limit = FE_READ(sc, FE_PSE_FQ_CFG) & FE_PSE_FQ_LIMIT_MASK;
++	if (limit <= reserved + 0x100) {
++		printf("%s: invalid PSE free queue limit %u\n", DEVNAME(sc), limit);
++		return EIO;
++	}
++	val = limit - reserved - 0x100;
++	FE_WRITE(sc, FE_PSE_BUF_SET, ((3 * val / 4) << 16) | reserved);
++	FE_WRITE(sc, FE_PSE_SHARE_THD, (val << 16) |
++	    (limit - reserved - 0x20));
++	return 0;
++}
++
++/* Both DMA directions must be stopped before clearing ring registers. */
++void
++aireth_qdma_init(struct aireth_softc *sc, bus_space_handle_t ioh)
++{
++	uint32_t len;
++	int n, bank;
++
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_GLOBAL_CFG, 0);
++	for (n = 0; n < 5; n++) {
++		for (bank = 0; bank < 4; bank++)
++			bus_space_write_4(sc->sc_iot, ioh,
++			    QDMA_INT_ENABLE(bank, n), 0);
++		bus_space_write_4(sc->sc_iot, ioh,
++		    QDMA_INT_STATUS(n), 0xffffffff);
++	}
++	/* Drain both completion queues before replacing their backing storage. */
++	len = QDMA_IRQ_STATUS_ENTRY_LEN(bus_space_read_4(sc->sc_iot, ioh,
++	    QDMA_IRQ_STATUS));
++	while (len > 0) {
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_IRQ_CLEAR_LEN,
++		    MIN(len, 0x80));
++		len -= MIN(len, 0x80);
++	}
++	len = QDMA_IRQ_STATUS_ENTRY_LEN(bus_space_read_4(sc->sc_iot, ioh,
++	    QDMA_IRQ1_STATUS));
++	while (len > 0) {
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_IRQ1_CLEAR_LEN,
++		    MIN(len, 0x80));
++		len -= MIN(len, 0x80);
++	}
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_TX_IRQ_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_TX_IRQ_BASE, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_TX_IRQ1_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_TX_IRQ1_BASE, 0);
++
++	for (n = 0; n < QDMA_NTXRINGS; n++) {
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_TXN(n, QDMA_TX_CPU_IDX), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_TXN(n, QDMA_TX_DMA_IDX), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_TXN(n, QDMA_TX_RING_BASE), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_TXN(n, QDMA_TX_RING_BLOCKING), 0);
++	}
++	for (n = 0; n < QDMA_NRXRINGS; n++) {
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_CPU_IDX), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_DMA_IDX), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_RING_SIZE), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_RING_BASE), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_DELAY_INT), 0);
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_RXN(n, QDMA_RX_SCATTER_CFG), 0);
++	}
++	/* Only queue 0/channel 0 is used: strict priority and no rate limits. */
++	for (n = 0; n < 8; n++)
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_QUEUE_CLOSE(n), 0);
++	/* Mode 0 is WRR with eight weights; mode 1 is strict priority. */
++	for (n = 0; n < QDMA_NQOSREGS; n++)
++		bus_space_write_4(sc->sc_iot, ioh, QDMA_CHAN_QOS_MODE(n),
++		    QDMA_CHAN_QOS_MODE_SP);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_INGRESS_TRTCM_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_EGRESS_RATE_METER_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_EGRESS_TRTCM_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_GLB_TRTCM_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_TXQ_CNGST_CFG, 0);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_SLA_TRTCM_CFG, 0);
++}
++
++int
++aireth_hw_init(struct aireth_softc *sc)
++{
++	/* The XSI MAC and PHY resets belong to the PCS, not the FE. */
++	static const char *resets[] = {
++		"fe", "pdma", "qdma"
++	};
++	struct aireth_buf *rxb;
++	struct regmap *rm = NULL;
++	uint32_t cells[2];
++	int i, error;
++
++	/*
++	 * The FE and QDMA registers read as 0xdeadbeef unless the
++	 * shared FE memory is switched away from the CPU.  The SCU is
++	 * the provider of our resets; OF_getpropint() won't do here as
++	 * "resets" holds more than one cell.
++	 */
++	if (OF_getpropintarray(sc->sc_node, "resets", cells,
++	    sizeof(cells)) >= (int)sizeof(cells))
++		rm = regmap_byphandle(cells[0]);
++	if (rm == NULL) {
++		printf("%s: can't find SCU\n", DEVNAME(sc));
++		return ENODEV;
++	}
++	regmap_write_4(rm, SCU_SHARE_FEMEM_SEL, 0);
++
++	for (i = 0; i < nitems(resets); i++)
++		reset_assert(sc->sc_node, resets[i]);
++	delay(20000);
++	for (i = 0; i < nitems(resets); i++)
++		reset_deassert(sc->sc_node, resets[i]);
++	delay(20000);
++	if ((error = aireth_fe_init(sc)) != 0)
++		return error;
++	aireth_qdma_init(sc, sc->sc_qdma_ioh);
++	if (sc->sc_txq[1].q_sc != NULL)
++		aireth_qdma_init(sc, sc->sc_txq[1].q_ioh);
++
++	/* Allocate Rx descriptor ring. */
++	sc->sc_rxring = aireth_dmamem_alloc(sc,
++	    AIRETH_NRXDESC * sizeof(struct aireth_desc), 32);
++	if (sc->sc_rxring == NULL) {
++		printf("%s: can't allocate DMA memory\n", DEVNAME(sc));
++		return ENOMEM;
++	}
++	sc->sc_rxdesc = AIRETH_DMA_KVA(sc->sc_rxring);
++	sc->sc_rxbuf = mallocarray(AIRETH_NRXDESC, sizeof(struct aireth_buf),
++	    M_DEVBUF, M_WAITOK);
++	for (i = 0; i < AIRETH_NRXDESC; i++) {
++		rxb = &sc->sc_rxbuf[i];
++		bus_dmamap_create(sc->sc_dmat, MCLBYTES, 1,
++		    MCLBYTES, 0, BUS_DMA_WAITOK, &rxb->tb_map);
++		rxb->tb_m = NULL;
++	}
++
++	for (i = 0; i < sc->sc_ntxq; i++)
++		if ((error = aireth_txq_init(sc, &sc->sc_txq[i])) != 0)
++			return error;
++
++	QDMA_WRITE(sc, QDMA_RX_RING_BASE, AIRETH_DMA_DVA(sc->sc_rxring));
++	QDMA_WRITE(sc, QDMA_RX_RING_SIZE, QDMA_RX_RING_THR(32) |
++	    AIRETH_NRXDESC);
++	QDMA_WRITE(sc, QDMA_RX_DELAY_INT, 0);
++	QDMA_WRITE(sc, QDMA_RX_SCATTER_CFG, 1);
++
++	QDMA_WRITE(sc, QDMA_INT_ENABLE0, 0);
++	QDMA_WRITE(sc, QDMA_INT_ENABLE1, 0);
++	QDMA_WRITE(sc, QDMA_INT_STATUS0, 0xffffffff);
++	QDMA_WRITE(sc, QDMA_INT_STATUS1, 0xffffffff);
++
++	return 0;
++}
++
++/* Release initialized rings before any interface has been attached or started. */
++void
++aireth_hw_free(struct aireth_softc *sc)
++{
++	struct aireth_txq *q;
++	int i, j;
++
++	for (i = 0; i < sc->sc_ntxq; i++) {
++		q = &sc->sc_txq[i];
++		for (j = 0; j < AIRETH_NTXDESC; j++)
++			bus_dmamap_destroy(sc->sc_dmat, q->q_buf[j].tb_map);
++		free(q->q_buf, M_DEVBUF,
++		    AIRETH_NTXDESC * sizeof(struct aireth_buf));
++		aireth_dmamem_free(sc, q->q_ring);
++		aireth_dmamem_free(sc, q->q_irqring);
++		aireth_dmamem_free(sc, q->q_fwddesc);
++		aireth_dmamem_free(sc, q->q_fwdbuf);
++	}
++	for (i = 0; i < AIRETH_NRXDESC; i++)
++		bus_dmamap_destroy(sc->sc_dmat, sc->sc_rxbuf[i].tb_map);
++	free(sc->sc_rxbuf, M_DEVBUF,
++	    AIRETH_NRXDESC * sizeof(struct aireth_buf));
++	aireth_dmamem_free(sc, sc->sc_rxring);
++}
++
++int
++aireth_txq_init(struct aireth_softc *sc, struct aireth_txq *q)
++{
++	struct aireth_buf *txb;
++	uint32_t val;
++	int i, timo;
++
++	q->q_ring = aireth_dmamem_alloc(sc,
++	    AIRETH_NTXDESC * sizeof(struct aireth_desc), 32);
++	q->q_buf = mallocarray(AIRETH_NTXDESC, sizeof(struct aireth_buf),
++	    M_DEVBUF, M_WAITOK);
++	for (i = 0; i < AIRETH_NTXDESC; i++) {
++		txb = &q->q_buf[i];
++		bus_dmamap_create(sc->sc_dmat, MCLBYTES, AIRETH_NTXSEGS,
++		    MCLBYTES, 0, BUS_DMA_WAITOK, &txb->tb_map);
++		txb->tb_m = NULL;
++	}
++
++	/* Tx completion queue. */
++	q->q_irqring = aireth_dmamem_alloc(sc,
++	    AIRETH_NIRQ * sizeof(uint32_t), 32);
++
++	/* Buffers for the hardware forwarding link manager. */
++	q->q_fwddesc = aireth_dmamem_alloc(sc,
++	    AIRETH_NFWDDESC * sizeof(struct aireth_fwd_desc), 32);
++	q->q_fwdbuf = aireth_dmamem_alloc(sc,
++	    AIRETH_NFWDDESC * AIRETH_FWDBUFSZ, PAGE_SIZE);
++	if (q->q_ring == NULL || q->q_irqring == NULL ||
++	    q->q_fwddesc == NULL || q->q_fwdbuf == NULL) {
++		printf("%s: can't allocate QDMA%d memory\n", DEVNAME(sc),
++		    q->q_id);
++		return ENOMEM;
++	}
++	q->q_desc = AIRETH_DMA_KVA(q->q_ring);
++	q->q_irq = AIRETH_DMA_KVA(q->q_irqring);
++
++	TXQ_WRITE(q, QDMA_FWD_DSCP_BASE, AIRETH_DMA_DVA(q->q_fwddesc));
++	TXQ_WRITE(q, QDMA_FWD_BUF_BASE, AIRETH_DMA_DVA(q->q_fwdbuf));
++	val = TXQ_READ(q, QDMA_HW_FWD_DSCP_CFG);
++	val &= ~(QDMA_HW_FWD_DSCP_PAYLOAD_MASK |
++	    QDMA_HW_FWD_DSCP_MIN_SCAT_MASK);
++	val |= 1;	/* 2KB payload, minimum scatter length 1 */
++	TXQ_WRITE(q, QDMA_HW_FWD_DSCP_CFG, val);
++	TXQ_WRITE(q, QDMA_FWD_DSCP_LOW_THR, AIRETH_NFWDDESC / 2);
++	val = TXQ_READ(q, QDMA_LMGR_INIT_CFG);
++	val &= ~(QDMA_LMGR_INIT_START | QDMA_LMGR_SRAM_MODE |
++	    QDMA_LMGR_DESC_NUM_MASK);
++	val |= QDMA_LMGR_INIT_START | AIRETH_NFWDDESC;
++	TXQ_WRITE(q, QDMA_LMGR_INIT_CFG, val);
++	for (timo = 30; timo > 0; timo--) {
++		delay(1000);
++		if ((TXQ_READ(q, QDMA_LMGR_INIT_CFG) &
++		    QDMA_LMGR_INIT_START) == 0)
++			break;
++	}
++	if (timo == 0) {
++		printf("%s: QDMA%d link manager init timeout\n", DEVNAME(sc),
++		    q->q_id);
++		return ETIMEDOUT;
++	}
++
++	TXQ_WRITE(q, QDMA_TX_IRQ_BASE, AIRETH_DMA_DVA(q->q_irqring));
++	TXQ_WRITE(q, QDMA_TX_IRQ_CFG, QDMA_TX_IRQ_THR(1) |
++	    QDMA_TX_IRQ_DEPTH(AIRETH_NIRQ));
++	TXQ_WRITE(q, QDMA_TX_RING_BASE, AIRETH_DMA_DVA(q->q_ring));
++
++	if (q->q_id != 0) {
++		TXQ_WRITE(q, QDMA_INT_ENABLE0, 0);
++		TXQ_WRITE(q, QDMA_INT_ENABLE1, 0);
++		TXQ_WRITE(q, QDMA_INT_STATUS0, 0xffffffff);
++		TXQ_WRITE(q, QDMA_INT_STATUS1, 0xffffffff);
++	}
++	TXQ_WRITE(q, QDMA_GLOBAL_CFG, QDMA_GLOBAL_CFG_DMA_PREF(3) |
++	    QDMA_GLOBAL_CFG_CPU_TXR_RR | QDMA_GLOBAL_CFG_PAYLOAD_SWAP |
++	    QDMA_GLOBAL_CFG_IRQ0_EN | QDMA_GLOBAL_CFG_TX_WB_DONE |
++	    QDMA_GLOBAL_CFG_MAX_ISSUE(2));
++
++	return 0;
++}
++
++void
++aireth_txq_up(struct aireth_txq *q)
++{
++	struct aireth_softc *sc = q->q_sc;
++	int i;
++
++	/* Hardware sets the DONE bit when it is finished with a slot. */
++	for (i = 0; i < AIRETH_NTXDESC; i++) {
++		memset(&q->q_desc[i], 0, sizeof(struct aireth_desc));
++		q->q_desc[i].ctrl = htole32(AIRETH_CTRL_DONE);
++	}
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(q->q_ring),
++	    0, AIRETH_DMA_LEN(q->q_ring), BUS_DMASYNC_PREWRITE);
++
++	q->q_prod = q->q_cons = 0;
++	TXQ_WRITE(q, QDMA_TX_CPU_IDX, 0);
++	TXQ_WRITE(q, QDMA_TX_DMA_IDX, 0);
++
++	memset(q->q_irq, 0xff, AIRETH_NIRQ * sizeof(uint32_t));
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(q->q_irqring),
++	    0, AIRETH_DMA_LEN(q->q_irqring), BUS_DMASYNC_PREWRITE);
++
++	TXQ_WRITE(q, QDMA_INT_STATUS0, QDMA_INT0_IRQ0 | QDMA_INT0_IRQ0_FULL);
++	TXQ_WRITE(q, QDMA_INT_ENABLE0, QDMA_INT0_IRQ0 | QDMA_INT0_IRQ0_FULL);
++	TXQ_WRITE(q, QDMA_GLOBAL_CFG, TXQ_READ(q, QDMA_GLOBAL_CFG) |
++	    QDMA_GLOBAL_CFG_TX_DMA_EN);
++}
++
++void
++aireth_txq_down(struct aireth_txq *q)
++{
++	struct aireth_softc *sc = q->q_sc;
++	struct aireth_buf *txb;
++	int i, timo;
++
++	TXQ_WRITE(q, QDMA_GLOBAL_CFG, TXQ_READ(q, QDMA_GLOBAL_CFG) &
++	    ~QDMA_GLOBAL_CFG_TX_DMA_EN);
++	for (timo = 1000; timo > 0; timo--) {
++		if ((TXQ_READ(q, QDMA_GLOBAL_CFG) &
++		    QDMA_GLOBAL_CFG_TX_DMA_BUSY) == 0)
++			break;
++		delay(10);
++	}
++	if (timo == 0) {
++		printf("%s: QDMA%d Tx stop timeout\n", DEVNAME(sc), q->q_id);
++		sc->sc_dma_failed = 1;
++	}
++	TXQ_WRITE(q, QDMA_INT_ENABLE0, 0);
++	if (q->q_ih)
++		intr_barrier(q->q_ih);
++	/* A busy engine may still access its buffers.  Keep them mapped. */
++	if (timo == 0)
++		return;
++
++	for (i = 0; i < AIRETH_NTXDESC; i++) {
++		txb = &q->q_buf[i];
++		if (txb->tb_m) {
++			bus_dmamap_sync(sc->sc_dmat, txb->tb_map, 0,
++			    txb->tb_map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
++			bus_dmamap_unload(sc->sc_dmat, txb->tb_map);
++			m_freem(txb->tb_m);
++			txb->tb_m = NULL;
++		}
++	}
++}
++
++void
++aireth_start(struct ifqueue *ifq)
++{
++	struct ifnet *ifp = ifq->ifq_if;
++	struct aireth_port *ap = ifp->if_softc;
++	struct aireth_txq *q = ap->ap_txq;
++	struct mbuf *m;
++	int error, idx, left, used;
++
++	if (!(ifp->if_flags & IFF_RUNNING))
++		return;
++	if (ifq_is_oactive(&ifp->if_snd))
++		return;
++	if (ifq_empty(&ifp->if_snd))
++		return;
++
++	mtx_enter(&q->q_mtx);
++	idx = q->q_prod;
++	left = q->q_cons;
++	if (left <= idx)
++		left += AIRETH_NTXDESC;
++	left -= idx;
++	used = 0;
++
++	for (;;) {
++		/* The ring must never become completely full. */
++		if (used + AIRETH_NTXSEGS + 1 > left) {
++			ifq_set_oactive(ifq);
++			break;
++		}
++
++		m = ifq_dequeue(ifq);
++		if (m == NULL)
++			break;
++
++		error = aireth_encap(q, ap, m, &idx, &used);
++		if (error == EFBIG) {
++			m_freem(m); /* give up: drop it */
++			ifp->if_oerrors++;
++			continue;
++		}
++
++#if NBPFILTER > 0
++		if (ifp->if_bpf)
++			bpf_mtap(ifp->if_bpf, m, BPF_DIRECTION_OUT);
++#endif
++	}
++
++	if (q->q_prod != idx) {
++		q->q_prod = idx;
++
++		/* Set a timeout in case the chip goes out to lunch. */
++		ifp->if_timer = 5;
++
++		TXQ_WRITE(q, QDMA_TX_CPU_IDX, idx);
++	}
++	mtx_leave(&q->q_mtx);
++}
++
++int
++aireth_ioctl(struct ifnet *ifp, u_long cmd, caddr_t addr)
++{
++	struct aireth_port *ap = ifp->if_softc;
++	struct aireth_softc *sc = ap->ap_sc;
++	struct ifreq *ifr = (struct ifreq *)addr;
++	int error = 0, s;
++
++	s = splnet();
++
++	switch (cmd) {
++	case SIOCSIFADDR:
++		ifp->if_flags |= IFF_UP;
++		/* FALLTHROUGH */
++	case SIOCSIFFLAGS:
++		if (ifp->if_flags & IFF_UP) {
++			if (ifp->if_flags & IFF_RUNNING)
++				error = ENETRESET;
++			else
++				error = aireth_port_up(ap);
++		} else {
++			if (ifp->if_flags & IFF_RUNNING)
++				aireth_port_down(ap);
++		}
++		/* "ifconfig aireth0 debug" dumps the counters. */
++		if (ifp->if_flags & IFF_DEBUG)
++			aireth_dump(sc);
++		break;
++
++	case SIOCGIFMEDIA:
++	case SIOCSIFMEDIA:
++		error = ifmedia_ioctl(ifp, ifr, &ap->ap_media, cmd);
++		break;
++
++	case SIOCGIFRXR:
++		error = if_rxr_ioctl((struct if_rxrinfo *)ifr->ifr_data,
++		    NULL, MCLBYTES, &sc->sc_rx_ring);
++		break;
++
++	default:
++		error = ether_ioctl(ifp, &ap->ap_ac, cmd, addr);
++		break;
++	}
++
++	/*
++	 * The GDMs forward all frames to the CPU, so there is no
++	 * receive filter to program.
++	 */
++	if (error == ENETRESET)
++		error = 0;
++
++	splx(s);
++	return (error);
++}
++
++void
++aireth_watchdog(struct ifnet *ifp)
++{
++	printf("%s: watchdog timeout\n", ifp->if_xname);
++	ifp->if_oerrors++;
++}
++
++int
++aireth_media_change(struct ifnet *ifp)
++{
++	struct aireth_port *ap = ifp->if_softc;
++
++	if (ap->ap_phy != -1 && (ifp->if_flags & IFF_RUNNING))
++		return en8811_aneg(&ap->ap_phydev);
++	return (0);
++}
++
++void
++aireth_media_status(struct ifnet *ifp, struct ifmediareq *ifmr)
++{
++	struct aireth_port *ap = ifp->if_softc;
++
++	ifmr->ifm_status = IFM_AVALID;
++	ifmr->ifm_active = ap->ap_active;
++	if ((ifp->if_flags & IFF_RUNNING) &&
++	    LINK_STATE_IS_UP(ifp->if_link_state))
++		ifmr->ifm_status |= IFM_ACTIVE;
++}
++
++void
++aireth_rxtick(void *arg)
++{
++	struct aireth_softc *sc = arg;
++	struct aireth_desc *rxd;
++	int s;
++
++	s = splnet();
++	/*
++	 * XXX Also poll the Rx ring every tick: the Rx done interrupt
++	 * has not been seen to fire after a kexec from Linux.  Count
++	 * what the interrupt should already have handled.
++	 */
++	mtx_enter(&sc->sc_rx_mtx);
++	if (sc->sc_nup > 0) {
++		bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(sc->sc_rxring), 0,
++		    AIRETH_DMA_LEN(sc->sc_rxring), BUS_DMASYNC_POSTREAD);
++		rxd = &sc->sc_rxdesc[sc->sc_rx_cons];
++		if (letoh32(rxd->ctrl) & AIRETH_CTRL_DONE)
++			sc->sc_rxpoll_hits++;
++		aireth_rx_proc(sc);
++		timeout_add(&sc->sc_rxto, 1);
++	} else
++		aireth_fill_rx_ring(sc);
++	mtx_leave(&sc->sc_rx_mtx);
++	splx(s);
++}
++
++int
++aireth_intr(void *arg)
++{
++	struct aireth_softc *sc = arg;
++	uint32_t intr1;
++	int handled;
++
++	handled = aireth_intr_txq(&sc->sc_txq[0]);
++
++	intr1 = QDMA_READ(sc, QDMA_INT_STATUS1) & QDMA_INT1_RX0_DONE;
++	if (intr1) {
++		QDMA_WRITE(sc, QDMA_INT_STATUS1, intr1);
++		mtx_enter(&sc->sc_rx_mtx);
++		aireth_rx_proc(sc);
++		mtx_leave(&sc->sc_rx_mtx);
++		handled = 1;
++	}
++
++	return (handled);
++}
++
++/* Tx completions of one QDMA (bank 0, IRQ0). */
++int
++aireth_intr_txq(void *arg)
++{
++	struct aireth_txq *q = arg;
++	uint32_t intr0, status;
++	int head, len, i, n;
++
++	intr0 = TXQ_READ(q, QDMA_INT_STATUS0) &
++	    (QDMA_INT0_IRQ0 | QDMA_INT0_IRQ0_FULL);
++	if (intr0 == 0)
++		return (0);
++	TXQ_WRITE(q, QDMA_INT_STATUS0, intr0);
++
++	/*
++	 * Consume the Tx completion queue.  Descriptors are completed
++	 * in order, so the entries themselves are not needed; the ring
++	 * is scanned instead.
++	 */
++	status = TXQ_READ(q, QDMA_IRQ_STATUS);
++	head = QDMA_IRQ_STATUS_HEAD(status) % AIRETH_NIRQ;
++	len = QDMA_IRQ_STATUS_ENTRY_LEN(status);
++	while (len > 0) {
++		n = MIN(len, 0x80);
++		for (i = 0; i < n; i++) {
++			q->q_irq[head] = 0xffffffff;
++			head = (head + 1) % AIRETH_NIRQ;
++		}
++		TXQ_WRITE(q, QDMA_IRQ_CLEAR_LEN, n);
++		len -= n;
++	}
++
++	aireth_tx_proc(q);
++	return (1);
++}
++
++void
++aireth_tx_proc(struct aireth_txq *q)
++{
++	struct aireth_softc *sc = q->q_sc;
++	struct aireth_desc *txd;
++	struct aireth_buf *txb;
++	struct aireth_port *ap;
++	struct ifnet *ifp;
++	int i, idx, txfree;
++
++	if (sc->sc_nup == 0)
++		return;
++
++	mtx_enter(&q->q_mtx);
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(q->q_ring), 0,
++	    AIRETH_DMA_LEN(q->q_ring),
++	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
++
++	txfree = 0;
++	while (q->q_cons != q->q_prod) {
++		idx = q->q_cons;
++		KASSERT(idx < AIRETH_NTXDESC);
++
++		txd = &q->q_desc[idx];
++		if ((letoh32(txd->ctrl) &
++		    (AIRETH_CTRL_DONE | AIRETH_CTRL_DROP)) == 0)
++			break;
++
++		txb = &q->q_buf[idx];
++		if (txb->tb_m) {
++			bus_dmamap_sync(sc->sc_dmat, txb->tb_map, 0,
++			    txb->tb_map->dm_mapsize, BUS_DMASYNC_POSTWRITE);
++			bus_dmamap_unload(sc->sc_dmat, txb->tb_map);
++
++			m_freem(txb->tb_m);
++			txb->tb_m = NULL;
++		}
++
++		txfree++;
++
++		if (q->q_cons == (AIRETH_NTXDESC - 1))
++			q->q_cons = 0;
++		else
++			q->q_cons++;
++	}
++	mtx_leave(&q->q_mtx);
++
++	for (i = 0; i < sc->sc_nports; i++) {
++		ap = &sc->sc_ports[i];
++		if (ap->ap_txq != q)
++			continue;
++		ifp = &ap->ap_ac.ac_if;
++		if (q->q_cons == q->q_prod)
++			ifp->if_timer = 0;
++		if (txfree && ifq_is_oactive(&ifp->if_snd))
++			ifq_restart(&ifp->if_snd);
++	}
++}
++
++void
++aireth_rx_proc(struct aireth_softc *sc)
++{
++	struct aireth_desc *rxd;
++	struct aireth_buf *rxb;
++	struct mbuf_list ml[AIRETH_NPORTS];
++	struct aireth_port *ap;
++	struct ifnet *ifp;
++	struct mbuf *m;
++	uint32_t ctrl, sport;
++	int i, idx, len, cnt, put, livelocked = 0;
++
++	if (sc->sc_nup == 0)
++		return;
++
++	for (i = 0; i < AIRETH_NPORTS; i++)
++		ml_init(&ml[i]);
++
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(sc->sc_rxring), 0,
++	    AIRETH_DMA_LEN(sc->sc_rxring),
++	    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
++
++	cnt = if_rxr_inuse(&sc->sc_rx_ring);
++	put = 0;
++	while (put < cnt) {
++		idx = sc->sc_rx_cons;
++		KASSERT(idx < AIRETH_NRXDESC);
++
++		rxd = &sc->sc_rxdesc[idx];
++		ctrl = letoh32(rxd->ctrl);
++		if ((ctrl & AIRETH_CTRL_DONE) == 0)
++			break;
++
++		len = ctrl & AIRETH_CTRL_LEN_MASK;
++		sport = AIRETH_RXMSG1_SPORT(letoh32(rxd->msg1));
++		rxb = &sc->sc_rxbuf[idx];
++		KASSERT(rxb->tb_m);
++
++		bus_dmamap_sync(sc->sc_dmat, rxb->tb_map, 0,
++		    rxb->tb_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
++		bus_dmamap_unload(sc->sc_dmat, rxb->tb_map);
++
++		m = rxb->tb_m;
++		rxb->tb_m = NULL;
++
++		/*
++		 * The QDMA splits some frames over several buffers
++		 * (MORE set on all but the last), as Linux expects too;
++		 * chain them.  The first fragment carries the port.
++		 */
++		if (sc->sc_rx_head == NULL) {
++			sc->sc_rxsport[sport]++;
++			sc->sc_rx_port = (sport == AIRETH_SPORT_GDM4 &&
++			    sc->sc_nports > 1) ? 1 : 0;
++		}
++		i = sc->sc_rx_port;
++		ap = &sc->sc_ports[i];
++		ifp = &ap->ap_ac.ac_if;
++
++		if (len == 0 || len > m->m_len) {
++			if (len == 0)
++				sc->sc_rxerr_len++;
++			else
++				sc->sc_rxerr_big++;
++			ifp->if_ierrors++;
++			m_freem(m);
++			m_freem(sc->sc_rx_head);
++			sc->sc_rx_head = sc->sc_rx_tail = NULL;
++			goto next;
++		}
++
++		m->m_len = len;
++		if (sc->sc_rx_head == NULL) {
++			m->m_pkthdr.len = len;
++			sc->sc_rx_head = sc->sc_rx_tail = m;
++		} else {
++			m->m_flags &= ~M_PKTHDR;
++			sc->sc_rx_tail->m_next = m;
++			sc->sc_rx_tail = m;
++			sc->sc_rx_head->m_pkthdr.len += len;
++		}
++		if ((ctrl & AIRETH_CTRL_MORE) || sc->sc_rx_head != m) {
++			sc->sc_rxfraglen[sc->sc_rxfragidx++ %
++			    nitems(sc->sc_rxfraglen)] = len;
++		}
++		if (ctrl & AIRETH_CTRL_MORE)
++			goto next;
++
++		m = sc->sc_rx_head;
++		sc->sc_rx_head = sc->sc_rx_tail = NULL;
++		if (m->m_next != NULL)
++			sc->sc_rxfrags++;
++		if ((ifp->if_flags & IFF_RUNNING) == 0)
++			m_freem(m);
++		else
++			ml_enqueue(&ml[i], m);
++next:
++
++		put++;
++		if (sc->sc_rx_cons == (AIRETH_NRXDESC - 1))
++			sc->sc_rx_cons = 0;
++		else
++			sc->sc_rx_cons++;
++	}
++
++	if_rxr_put(&sc->sc_rx_ring, put);
++	for (i = 0; i < sc->sc_nports; i++) {
++		ifp = &sc->sc_ports[i].ap_ac.ac_if;
++		if (!ml_empty(&ml[i]) && ifiq_input(&ifp->if_rcv, &ml[i]))
++			livelocked = 1;
++	}
++	if (livelocked)
++		if_rxr_livelocked(&sc->sc_rx_ring);
++
++	aireth_fill_rx_ring(sc);
++}
++
++void
++aireth_up(struct aireth_softc *sc)
++{
++	int i;
++
++	memset(sc->sc_rxdesc, 0, AIRETH_NRXDESC * sizeof(struct aireth_desc));
++
++	/* One slot is kept empty to tell a full ring from an empty one. */
++	/*
++	 * Start above QDMA_RX_RING_THR (32): with fewer free descriptors
++	 * the QDMA reports RX0_NO_CPU_DSCP instead of using them.
++	 */
++	if_rxr_init(&sc->sc_rx_ring, 64, AIRETH_NRXDESC - 1);
++
++	sc->sc_rx_prod = sc->sc_rx_cons = 0;
++	m_freem(sc->sc_rx_head);
++	sc->sc_rx_head = sc->sc_rx_tail = NULL;
++	QDMA_WRITE(sc, QDMA_RX_DMA_IDX, 0);
++	QDMA_WRITE(sc, QDMA_RX_CPU_IDX, 0);
++	aireth_fill_rx_ring(sc);
++
++	QDMA_WRITE(sc, QDMA_INT_STATUS1, 0xffffffff);
++	QDMA_WRITE(sc, QDMA_INT_ENABLE1, QDMA_INT1_RX0_DONE);
++
++	aireth_quiesce_rx_rings(sc);
++	QDMA_WRITE(sc, QDMA_GLOBAL_CFG, QDMA_READ(sc, QDMA_GLOBAL_CFG) |
++	    QDMA_GLOBAL_CFG_RX_DMA_EN);
++	for (i = 0; i < sc->sc_ntxq; i++)
++		aireth_txq_up(&sc->sc_txq[i]);
++
++	timeout_add(&sc->sc_rxto, 1);
++}
++
++int
++aireth_port_up(struct aireth_port *ap)
++{
++	struct aireth_softc *sc = ap->ap_sc;
++	struct ifnet *ifp = &ap->ap_ac.ac_if;
++	uint32_t val;
++	int error;
++
++	/* Timed-out DMA still owns buffers and descriptors: don't reuse them. */
++	if (sc->sc_dma_failed)
++		return EIO;
++	if (ap->ap_phy != -1 &&
++	    (error = en8811_aneg(&ap->ap_phydev)) != 0)
++		return error;
++
++	if (sc->sc_nup++ == 0)
++		aireth_up(sc);
++
++	ifp->if_flags |= IFF_RUNNING;
++	ifq_clr_oactive(&ifp->if_snd);
++
++	/* Deliver this port's frames to CDM1, QDMA0 Rx ring 0. */
++	val = FE_READ(sc, FE_GDM_FWD_CFG(ap->ap_gdm));
++	FE_WRITE(sc, FE_GDM_FWD_CFG(ap->ap_gdm),
++	    val & ~FE_GDM_FWD_CFG_QSEL_MASK);
++
++	if (ap->ap_phy == -1) {
++		ifp->if_link_state = LINK_STATE_FULL_DUPLEX;
++		if_link_state_change(ifp);
++	} else
++		aireth_port_tick(ap);
++	return 0;
++}
++
++void
++aireth_port_down(struct aireth_port *ap)
++{
++	struct aireth_softc *sc = ap->ap_sc;
++	struct ifnet *ifp = &ap->ap_ac.ac_if;
++	uint32_t val;
++
++	if (ap->ap_phy != -1)
++		timeout_del_barrier(&ap->ap_tick);
++#if NAIRPCS > 0
++	if (ap->ap_pcs != NULL)
++		airpcs_down(ap->ap_pcs);
++#endif
++	val = FE_READ(sc, FE_GDM_FWD_CFG(ap->ap_gdm));
++	FE_WRITE(sc, FE_GDM_FWD_CFG(ap->ap_gdm),
++	    val | FE_GDM_FWD_CFG_DROP);
++
++	ifp->if_flags &= ~IFF_RUNNING;
++	ifq_clr_oactive(&ifp->if_snd);
++	ifp->if_timer = 0;
++	ifp->if_link_state = LINK_STATE_DOWN;
++	if_link_state_change(ifp);
++	ifq_barrier(&ifp->if_snd);
++
++	if (--sc->sc_nup == 0)
++		aireth_down(sc);
++}
++
++void
++aireth_down(struct aireth_softc *sc)
++{
++	struct aireth_buf *rxb;
++	int i, timo;
++
++	timeout_del_barrier(&sc->sc_rxto);
++
++	for (i = 0; i < sc->sc_ntxq; i++)
++		aireth_txq_down(&sc->sc_txq[i]);
++
++	QDMA_WRITE(sc, QDMA_GLOBAL_CFG, QDMA_READ(sc, QDMA_GLOBAL_CFG) &
++	    ~QDMA_GLOBAL_CFG_RX_DMA_EN);
++	for (timo = 1000; timo > 0; timo--) {
++		if ((QDMA_READ(sc, QDMA_GLOBAL_CFG) &
++		    QDMA_GLOBAL_CFG_RX_DMA_BUSY) == 0)
++			break;
++		delay(10);
++	}
++	if (timo == 0) {
++		printf("%s: Rx DMA stop timeout\n", DEVNAME(sc));
++		sc->sc_dma_failed = 1;
++	}
++	QDMA_WRITE(sc, QDMA_INT_ENABLE1, 0);
++	intr_barrier(sc->sc_ih);
++	/* Retain the buffers until the engine can no longer write to them. */
++	if (timo == 0)
++		return;
++
++	for (i = 0; i < AIRETH_NRXDESC; i++) {
++		rxb = &sc->sc_rxbuf[i];
++		if (rxb->tb_m) {
++			bus_dmamap_sync(sc->sc_dmat, rxb->tb_map, 0,
++			    rxb->tb_map->dm_mapsize, BUS_DMASYNC_POSTREAD);
++			bus_dmamap_unload(sc->sc_dmat, rxb->tb_map);
++			m_freem(rxb->tb_m);
++			rxb->tb_m = NULL;
++		}
++	}
++}
++
++int
++aireth_encap(struct aireth_txq *q, struct aireth_port *ap, struct mbuf *m,
++    int *idx, int *used)
++{
++	struct aireth_softc *sc = q->q_sc;
++	struct aireth_desc *txd;
++	bus_dmamap_t map;
++	uint32_t ctrl;
++	int cur, frag, i;
++
++	cur = frag = *idx;
++	map = q->q_buf[cur].tb_map;
++
++	if (bus_dmamap_load_mbuf(sc->sc_dmat, map, m, BUS_DMA_NOWAIT)) {
++		if (m_defrag(m, M_DONTWAIT))
++			return (EFBIG);
++		if (bus_dmamap_load_mbuf(sc->sc_dmat, map, m, BUS_DMA_NOWAIT))
++			return (EFBIG);
++	}
++
++	bus_dmamap_sync(sc->sc_dmat, map, 0, map->dm_mapsize,
++	    BUS_DMASYNC_PREWRITE);
++
++	for (i = 0; i < map->dm_nsegs; i++) {
++		txd = &q->q_desc[frag];
++		cur = frag;
++		if (frag == (AIRETH_NTXDESC - 1))
++			frag = 0;
++		else
++			frag++;
++
++		ctrl = map->dm_segs[i].ds_len & AIRETH_CTRL_LEN_MASK;
++		if (i != map->dm_nsegs - 1)
++			ctrl |= AIRETH_CTRL_MORE;
++
++		txd->addr = htole32(map->dm_segs[i].ds_addr);
++		txd->data = htole32(frag);
++		txd->msg0 = 0;
++		txd->msg1 = htole32(AIRETH_TXMSG1_METER(0x7f) |
++		    AIRETH_TXMSG1_FPORT(ap->ap_fport));
++		txd->msg2 = htole32(0xffff);
++		txd->msg3 = 0;
++		txd->ctrl = htole32(ctrl);
++	}
++
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(q->q_ring), 0,
++	    AIRETH_DMA_LEN(q->q_ring), BUS_DMASYNC_PREWRITE);
++
++	/* Keep the map and mbuf together in the last slot. */
++	KASSERT(q->q_buf[cur].tb_m == NULL);
++	q->q_buf[*idx].tb_map = q->q_buf[cur].tb_map;
++	q->q_buf[cur].tb_map = map;
++	q->q_buf[cur].tb_m = m;
++
++	*idx = frag;
++	*used += map->dm_nsegs;
++
++	return (0);
++}
++
++struct aireth_dmamem *
++aireth_dmamem_alloc(struct aireth_softc *sc, bus_size_t size, bus_size_t align)
++{
++	struct aireth_dmamem *tdm;
++	int nsegs;
++
++	tdm = malloc(sizeof(*tdm), M_DEVBUF, M_WAITOK | M_ZERO);
++	tdm->tdm_size = size;
++
++	if (bus_dmamap_create(sc->sc_dmat, size, 1, size, 0,
++	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &tdm->tdm_map) != 0)
++		goto tdmfree;
++
++	if (bus_dmamem_alloc(sc->sc_dmat, size, align, 0, &tdm->tdm_seg, 1,
++	    &nsegs, BUS_DMA_WAITOK) != 0)
++		goto destroy;
++
++	if (bus_dmamem_map(sc->sc_dmat, &tdm->tdm_seg, nsegs, size,
++	    &tdm->tdm_kva, BUS_DMA_WAITOK | BUS_DMA_COHERENT) != 0)
++		goto free;
++
++	if (bus_dmamap_load(sc->sc_dmat, tdm->tdm_map, tdm->tdm_kva, size,
++	    NULL, BUS_DMA_WAITOK) != 0)
++		goto unmap;
++
++	bzero(tdm->tdm_kva, size);
++
++	return (tdm);
++
++unmap:
++	bus_dmamem_unmap(sc->sc_dmat, tdm->tdm_kva, size);
++free:
++	bus_dmamem_free(sc->sc_dmat, &tdm->tdm_seg, 1);
++destroy:
++	bus_dmamap_destroy(sc->sc_dmat, tdm->tdm_map);
++tdmfree:
++	free(tdm, M_DEVBUF, sizeof(*tdm));
++
++	return (NULL);
++}
++
++void
++aireth_dmamem_free(struct aireth_softc *sc, struct aireth_dmamem *tdm)
++{
++	bus_dmamap_unload(sc->sc_dmat, tdm->tdm_map);
++	bus_dmamem_unmap(sc->sc_dmat, tdm->tdm_kva, tdm->tdm_size);
++	bus_dmamem_free(sc->sc_dmat, &tdm->tdm_seg, 1);
++	bus_dmamap_destroy(sc->sc_dmat, tdm->tdm_map);
++	free(tdm, M_DEVBUF, sizeof(*tdm));
++}
++
++struct mbuf *
++aireth_alloc_mbuf(struct aireth_softc *sc, bus_dmamap_t map)
++{
++	struct mbuf *m = NULL;
++
++	m = MCLGETL(NULL, M_DONTWAIT, MCLBYTES);
++	if (!m)
++		return (NULL);
++	m->m_len = m->m_pkthdr.len = MCLBYTES;
++
++	if (bus_dmamap_load_mbuf(sc->sc_dmat, map, m, BUS_DMA_NOWAIT) != 0) {
++		printf("%s: could not load mbuf DMA map", DEVNAME(sc));
++		m_freem(m);
++		return (NULL);
++	}
++
++	bus_dmamap_sync(sc->sc_dmat, map, 0,
++	    m->m_pkthdr.len, BUS_DMASYNC_PREREAD);
++
++	return (m);
++}
++
++void
++aireth_fill_rx_ring(struct aireth_softc *sc)
++{
++	struct aireth_desc *rxd;
++	struct aireth_buf *rxb;
++	u_int slots;
++	int prod;
++
++	prod = sc->sc_rx_prod;
++	for (slots = if_rxr_get(&sc->sc_rx_ring, AIRETH_NRXDESC - 1);
++	    slots > 0; slots--) {
++		rxb = &sc->sc_rxbuf[sc->sc_rx_prod];
++		rxb->tb_m = aireth_alloc_mbuf(sc, rxb->tb_map);
++		if (rxb->tb_m == NULL)
++			break;
++
++		rxd = &sc->sc_rxdesc[sc->sc_rx_prod];
++
++		if (sc->sc_rx_prod == (AIRETH_NRXDESC - 1))
++			sc->sc_rx_prod = 0;
++		else
++			sc->sc_rx_prod++;
++
++		rxd->addr = htole32(rxb->tb_map->dm_segs[0].ds_addr);
++		rxd->data = htole32(sc->sc_rx_prod);
++		rxd->msg0 = rxd->msg1 = rxd->msg2 = rxd->msg3 = 0;
++		rxd->ctrl = htole32(rxb->tb_map->dm_segs[0].ds_len &
++		    AIRETH_CTRL_LEN_MASK);
++	}
++	if_rxr_put(&sc->sc_rx_ring, slots);
++
++	if (sc->sc_rx_prod != prod) {
++		bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(sc->sc_rxring), 0,
++		    AIRETH_DMA_LEN(sc->sc_rxring),
++		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
++		QDMA_WRITE(sc, QDMA_RX_CPU_IDX, sc->sc_rx_prod);
++	}
++
++	if (if_rxr_inuse(&sc->sc_rx_ring) == 0)
++		timeout_add(&sc->sc_rxto, 1);
++}
++
++/*
++ * Rx DMA is enabled for all 32 rings at once, and the QDMA reset does
++ * not clear them: rings Linux set up before a kexec still point at its
++ * buffers, which are now our memory.  Leave them no free descriptor
++ * (CPU index == DMA index) and forget them.
++ */
++int
++aireth_quiesce_rings(struct aireth_softc *sc, bus_space_handle_t ioh,
++    int first)
++{
++	uint32_t idx;
++	int n, cnt = 0;
++
++	for (n = first; n < QDMA_NRXRINGS; n++) {
++		if (bus_space_read_4(sc->sc_iot, ioh,
++		    QDMA_RXN(n, QDMA_RX_RING_BASE)) == 0)
++			continue;
++		idx = bus_space_read_4(sc->sc_iot, ioh,
++		    QDMA_RXN(n, QDMA_RX_DMA_IDX)) & QDMA_RX_IDX_MASK;
++		bus_space_write_4(sc->sc_iot, ioh,
++		    QDMA_RXN(n, QDMA_RX_CPU_IDX), idx);
++		bus_space_write_4(sc->sc_iot, ioh,
++		    QDMA_RXN(n, QDMA_RX_RING_SIZE), 0);
++		bus_space_write_4(sc->sc_iot, ioh,
++		    QDMA_RXN(n, QDMA_RX_RING_BASE), 0);
++		cnt++;
++	}
++	return cnt;
++}
++
++void
++aireth_quiesce_rx_rings(struct aireth_softc *sc)
++{
++	int cnt;
++
++	cnt = aireth_quiesce_rings(sc, sc->sc_qdma_ioh, 1);	/* not ring 0 */
++	if (cnt > 0)
++		printf("%s: disabled %d stale QDMA0 Rx rings\n",
++		    DEVNAME(sc), cnt);
++}
++
++/* Stop either QDMA before changing any of its ring registers. */
++int
++aireth_stop_qdma(struct aireth_softc *sc, bus_space_handle_t ioh)
++{
++	uint32_t val;
++	int timo, n, bank;
++
++	for (n = 0; n < 5; n++)
++		for (bank = 0; bank < 4; bank++)
++			bus_space_write_4(sc->sc_iot, ioh,
++			    QDMA_INT_ENABLE(bank, n), 0);
++	val = bus_space_read_4(sc->sc_iot, ioh, QDMA_GLOBAL_CFG);
++	bus_space_write_4(sc->sc_iot, ioh, QDMA_GLOBAL_CFG,
++	    val & ~(QDMA_GLOBAL_CFG_TX_DMA_EN | QDMA_GLOBAL_CFG_RX_DMA_EN));
++	for (timo = 1000; timo > 0; timo--) {
++		if ((bus_space_read_4(sc->sc_iot, ioh, QDMA_GLOBAL_CFG) &
++		    (QDMA_GLOBAL_CFG_TX_DMA_BUSY |
++		    QDMA_GLOBAL_CFG_RX_DMA_BUSY)) == 0)
++			break;
++		delay(10);
++	}
++	if (timo == 0)
++		return ETIMEDOUT;
++	aireth_quiesce_rings(sc, ioh, 0);
++	for (n = 0; n < 5; n++)
++		bus_space_write_4(sc->sc_iot, ioh,
++		    QDMA_INT_STATUS(n), 0xffffffff);
++	return 0;
++}
++
++/*
++ * Counters along the receive path, outermost first: switch ports, the
++ * GDM1 MAC facing the switch, then the QDMA ring indices.
++ */
++void
++aireth_dump(struct aireth_softc *sc)
++{
++	bus_size_t b;
++	int g, i, idx;
++
++#if NAIRSW > 0
++	airsw_dump();
++#endif
++	for (i = 0; i < sc->sc_nports; i++) {
++		g = sc->sc_ports[i].ap_gdm;
++#if NAIRPCS > 0
++		if (sc->sc_ports[i].ap_pcs != NULL)
++			airpcs_dump(sc->sc_ports[i].ap_pcs);
++#endif
++		b = FE_GDM_BASE(g);
++		printf("%s: GDM%d rx ok %u eth %u bc %u drop eth %u fc %u "
++		    "rc %u ovf %u err %u\n", sc->sc_ports[i].ap_ac.ac_if.if_xname,
++		    g, FE_READ(sc, b + FE_GDM_RX_OK_PKT_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_ETH_PKT_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_ETH_BC_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_ETH_DROP_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_FC_DROP_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_RC_DROP_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_OVERFLOW_DROP_CNT),
++		    FE_READ(sc, b + FE_GDM_RX_ERROR_DROP_CNT));
++		printf("%s: GDM%d tx ok %u eth %u drop %u; fwd 0x%08x "
++		    "ingress 0x%08x len 0x%08x\n",
++		    sc->sc_ports[i].ap_ac.ac_if.if_xname, g,
++		    FE_READ(sc, b + FE_GDM_TX_OK_PKT_CNT),
++		    FE_READ(sc, b + FE_GDM_TX_ETH_PKT_CNT),
++		    FE_READ(sc, b + FE_GDM_TX_ETH_DROP_CNT),
++		    FE_READ(sc, FE_GDM_FWD_CFG(g)),
++		    FE_READ(sc, FE_GDM_INGRESS_CFG(g)),
++		    FE_READ(sc, FE_GDM_LEN_CFG(g)));
++	}
++	printf("%s: dma_glo 0x%08x\n", DEVNAME(sc), FE_READ(sc, FE_DMA_GLO_CFG));
++	printf("%s: vip 0x%08x ifc 0x%08x wan cpu 0x%08x sport 0x%08x\n",
++	    DEVNAME(sc), FE_READ(sc, FE_VIP_PORT_EN),
++	    FE_READ(sc, FE_IFC_PORT_EN), FE_READ(sc, FE_SP_DFT_CPORT(3)),
++	    FE_READ(sc, FE_GDM_SRC_PORT_SET(4)));
++	printf("%s: PSE limit %u buf 0x%08x thresholds 0x%08x\n",
++	    DEVNAME(sc), FE_READ(sc, FE_PSE_FQ_CFG) & FE_PSE_FQ_LIMIT_MASK,
++	    FE_READ(sc, FE_PSE_BUF_SET), FE_READ(sc, FE_PSE_SHARE_THD));
++	printf("%s: QDMA glo 0x%08x int0 0x%08x/0x%08x int1 0x%08x/0x%08x "
++	    "(status/enable)\n", DEVNAME(sc),
++	    QDMA_READ(sc, QDMA_GLOBAL_CFG),
++	    QDMA_READ(sc, QDMA_INT_STATUS0), QDMA_READ(sc, QDMA_INT_ENABLE0),
++	    QDMA_READ(sc, QDMA_INT_STATUS1), QDMA_READ(sc, QDMA_INT_ENABLE1));
++	printf("%s: rx cpu %u dma %u prod %d cons %d inuse %u poll hits %u "
++	    "frag %u len0 %u big %u; tx cpu %u dma %u\n", DEVNAME(sc),
++	    QDMA_READ(sc, QDMA_RX_CPU_IDX), QDMA_READ(sc, QDMA_RX_DMA_IDX),
++	    sc->sc_rx_prod, sc->sc_rx_cons, if_rxr_inuse(&sc->sc_rx_ring),
++	    sc->sc_rxpoll_hits,
++	    sc->sc_rxfrags, sc->sc_rxerr_len, sc->sc_rxerr_big,
++	    QDMA_READ(sc, QDMA_TX_CPU_IDX), QDMA_READ(sc, QDMA_TX_DMA_IDX));
++	printf("%s: rx reassembled %u, last fragment lengths", DEVNAME(sc),
++	    sc->sc_rxfrags);
++	for (i = 0; i < nitems(sc->sc_rxfraglen); i++)
++		printf(" %u", sc->sc_rxfraglen[(sc->sc_rxfragidx + i) %
++		    nitems(sc->sc_rxfraglen)]);
++	printf("; frames by source port:");
++	for (i = 0; i < nitems(sc->sc_rxsport); i++)
++		if (sc->sc_rxsport[i])
++			printf(" 0x%02x:%u", i, sc->sc_rxsport[i]);
++	printf("\n");
++	for (i = 1; i < sc->sc_ntxq; i++)
++		printf("%s: QDMA%d glo 0x%08x int0 0x%08x/0x%08x "
++		    "tx cpu %u dma %u prod %d cons %d\n", DEVNAME(sc), i,
++		    TXQ_READ(&sc->sc_txq[i], QDMA_GLOBAL_CFG),
++		    TXQ_READ(&sc->sc_txq[i], QDMA_INT_STATUS0),
++		    TXQ_READ(&sc->sc_txq[i], QDMA_INT_ENABLE0),
++		    TXQ_READ(&sc->sc_txq[i], QDMA_TX_CPU_IDX),
++		    TXQ_READ(&sc->sc_txq[i], QDMA_TX_DMA_IDX),
++		    sc->sc_txq[i].q_prod, sc->sc_txq[i].q_cons);
++	bus_dmamap_sync(sc->sc_dmat, AIRETH_DMA_MAP(sc->sc_rxring), 0,
++	    AIRETH_DMA_LEN(sc->sc_rxring), BUS_DMASYNC_POSTREAD);
++	for (i = 1; i < QDMA_NRXRINGS; i++) {
++		if (QDMA_READ(sc, QDMA_RXN(i, QDMA_RX_RING_BASE)) == 0)
++			continue;
++		printf("%s: Rx ring %d base 0x%08x size 0x%08x cpu %u dma %u\n",
++		    DEVNAME(sc), i,
++		    QDMA_READ(sc, QDMA_RXN(i, QDMA_RX_RING_BASE)),
++		    QDMA_READ(sc, QDMA_RXN(i, QDMA_RX_RING_SIZE)),
++		    QDMA_READ(sc, QDMA_RXN(i, QDMA_RX_CPU_IDX)),
++		    QDMA_READ(sc, QDMA_RXN(i, QDMA_RX_DMA_IDX)));
++	}
++	for (i = 0; i < 4; i++) {
++		idx = (sc->sc_rx_cons + i) % AIRETH_NRXDESC;
++		printf("%s: rxd[%d] ctrl 0x%08x addr 0x%08x data 0x%08x "
++		    "msg 0x%08x 0x%08x\n", DEVNAME(sc), idx,
++		    letoh32(sc->sc_rxdesc[idx].ctrl),
++		    letoh32(sc->sc_rxdesc[idx].addr),
++		    letoh32(sc->sc_rxdesc[idx].data),
++		    letoh32(sc->sc_rxdesc[idx].msg0),
++		    letoh32(sc->sc_rxdesc[idx].msg1));
++	}
++}
+diff --git a/uvm/uvm_fault.c b/uvm/uvm_fault.c
+index 866b378..53eeed9 100644
+--- a/uvm/uvm_fault.c
++++ b/uvm/uvm_fault.c
+@@ -165,6 +165,21 @@ void	uvmfault_update_stats(struct uvm_faultinfo *);
+ /*
+  * inline functions
+  */
++/*
++ * uvmfault_pmap_nomem: should a failed pmap allocation kill the faulting
++ * process (ENOMEM) instead of waiting and refaulting?
++ *
++ * Only when there is swap and it is full.  Without any swap (a ramdisk
++ * system) uvm_swapisfull() is always true, so a transient failure,
++ * e.g. pmap_enter() running out of PR_NOWAIT pool pages for a moment,
++ * would SIGKILL the process.
++ */
++static inline int
++uvmfault_pmap_nomem(void)
++{
++	return atomic_load_sint(&uvmexp.swpages) > 0 && uvm_swapisfull();
++}
++
+ /*
+  * uvmfault_anonflush: try and deactivate pages in specified anons
+  *
+@@ -1139,7 +1154,7 @@ retry:
+ 		 * as the map may change while we're asleep.
+ 		 */
+ 		uvmfault_unlockall(ufi, amap, NULL);
+-		if (uvm_swapisfull()) {
++		if (uvmfault_pmap_nomem()) {
+ 			/* XXX instrumentation */
+ 			return ENOMEM;
+ 		}
+@@ -1517,7 +1532,7 @@ uvm_fault_lower(struct uvm_faultinfo *ufi, struct uvm_faultctx *flt,
+ 		atomic_clearbits_int(&pg->pg_flags, PG_BUSY|PG_FAKE|PG_WANTED);
+ 		UVM_PAGE_OWN(pg, NULL);
+ 		uvmfault_unlockall(ufi, amap, uobj);
+-		if (uvm_swapisfull()) {
++		if (uvmfault_pmap_nomem()) {
+ 			/* XXX instrumentation */
+ 			return (ENOMEM);
+ 		}

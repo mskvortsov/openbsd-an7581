@@ -1,0 +1,31 @@
+name: Build AN7581 kernels
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "openbsd-an7581.patch"
+      - ".github/workflows/build.yml"
+      - "scripts/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build on OpenBSD 8.0 amd64
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "8.0"
+          arch: x86_64
+          mem: 8192
+          prepare: |
+            pkg_add llvm-21.1.8p7
+          run: ./scripts/build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: an7581-kernels
+          path: |
+            dist/bsd.rd
+            dist/bsd.mp
