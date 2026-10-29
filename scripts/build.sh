@@ -40,6 +40,10 @@ umount "$WORK/mnt"
 vnconfig -u vnd0
 rdsetroot "$ROOT/dist/bsd.rd" "$WORK/disk.fs"
 
+# The kexec-loaded kernel cannot rely on a boot loader to identify its root disk.
+sed 's/^config[[:space:]]*bsd[[:space:]]*swap generic$/config bsd root on sd0a swap on sd0b/' \
+    "$SRC/sys/arch/arm64/conf/GENERIC" > "$WORK/GENERIC"
+mv "$WORK/GENERIC" "$SRC/sys/arch/arm64/conf/GENERIC"
 config -b "$OBJ/GENERIC.MP" -s "$SRC/sys" GENERIC.MP
 make -C "$OBJ/GENERIC.MP" -j"$JOBS" CC="$CC" LD="$LD" > "$OBJ/GENERIC.MP/build.log" 2>&1 || true
 /usr/local/bin/llvm-objcopy-21 --strip-debug "$OBJ/GENERIC.MP/bsd.gdb" "$OBJ/GENERIC.MP/bsd"
